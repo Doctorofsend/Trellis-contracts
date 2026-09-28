@@ -662,6 +662,10 @@ impl NftMarketplace {
         shared::sanitize::validate_external_url(&ipfs_uri, shared::sanitize::MAX_URL_LEN, false)
             .map_err(|_| MarketError::InvalidArgument)?;
 
+        if royalty_recipients.len() > MAX_ROYALTY_RECIPIENTS {
+            return Err(MarketError::InvalidArgument);
+        }
+
         let mut total_bps: i128 = 0;
         for r in royalty_recipients.iter() {
             if r.share_bps < 0 || r.share_bps > MAX_ROYALTY_BPS {
@@ -669,10 +673,6 @@ impl NftMarketplace {
             }
             total_bps += r.share_bps;
         }
-        if royalty_recipients.len() > MAX_ROYALTY_RECIPIENTS {
-            return Err(MarketError::InvalidArgument);
-        }
-
         let info = CollectionInfo {
             address: collection.clone(),
             admin: caller.clone(),
@@ -713,6 +713,10 @@ impl NftMarketplace {
 
         if info.admin != caller {
             return Err(MarketError::Unauthorized);
+        }
+
+        if royalty_recipients.len() > MAX_ROYALTY_RECIPIENTS {
+            return Err(MarketError::InvalidArgument);
         }
 
         let mut total_bps: i128 = 0;
@@ -1817,6 +1821,30 @@ mod tests {
             ),
             Err(Ok(MarketError::CollectionAlreadyRegistered))
         );
+    }
+
+    #[test]
+    fn oversized_royalty_update_is_rejected_before_scanning_or_mutating() {
+        let m = setup();
+        init(&m);
+        let c = client(&m);
+        let mut recipients = Vec::new(&m.env);
+        for _ in 0..=MAX_ROYALTY_RECIPIENTS {
+            recipients.push_back(RoyaltyRecipient {
+                address: Address::generate(&m.env),
+                share_bps: 10,
+            });
+        }
+
+        assert_eq!(
+            c.try_set_collection_royalties(&m.admin, &m.nft_collection, &recipients),
+            Err(Ok(MarketError::InvalidArgument))
+        );
+        assert!(c
+            .get_collection(&m.nft_collection)
+            .royalty_config
+            .recipients
+            .is_empty());
     }
 
     // ── Fixed-price listing ─────────────────────────────────────────
