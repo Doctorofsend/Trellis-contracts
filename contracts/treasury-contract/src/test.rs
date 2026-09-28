@@ -238,8 +238,11 @@ fn test_admin_can_add_and_remove_treasury_manager() {
 /// Stands in for the referral contract: it forwards to the treasury's
 /// `distribute_reward`, so from the treasury's perspective the direct caller
 /// is this contract's own address (whichever instance is registered).
+///
+/// `pub(crate)` so the budget regression suite in `budget_test.rs` can reuse
+/// the same stand-in instead of defining a second one.
 #[contract]
-struct MockReferralCaller;
+pub(crate) struct MockReferralCaller;
 
 #[contractimpl]
 impl MockReferralCaller {

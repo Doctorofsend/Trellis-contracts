@@ -12,6 +12,7 @@
 - [Identified Hotspots & Applied Optimizations](#identified-hotspots--applied-optimizations)
 - [Benchmark Infrastructure](#benchmark-infrastructure)
 - [CI Gas Regression Checks](#ci-gas-regression-checks)
+- [Budget Regression Thresholds](#budget-regression-thresholds)
 
 ---
 
@@ -171,8 +172,13 @@ cargo test -- gas_bench persistent_read
 
 ### What the Benchmarks Measure
 
-Since Soroban's test host doesn't expose raw CU counts, the benchmarks measure
-**behavioral correctness of optimized paths**:
+The `gas_bench_*` tests below measure **behavioral correctness of optimized
+paths**, not cost. They assert that a cheap validation runs before an expensive
+one, not how many instructions either consumes — for the paths that carry a hard
+ceiling, see [Budget Regression Thresholds](#budget-regression-thresholds).
+
+The test host *does* expose its own cost meters (`Env::budget()`), which is what
+the budget suite below reads. The earlier claim that it does not was wrong.
 
 - `gas_bench_accrue_3_tier`: Verifies pre-cached tier BPS produces correct
   results for a 3-tier chain.
@@ -211,6 +217,96 @@ The workflow:
 This ensures that future changes don't silently break gas optimizations.
 
 ---
+
+---
+
+## Budget Regression Thresholds
+
+`gas_bench_*` proves validation *ordering*; it does not fail when a path gets more
+expensive. `contracts/treasury-contract/src/budget_test.rs` closes that gap: it
+runs the treasury's critical entry points against the host's own cost meters
+(`Env::budget().cpu_instruction_cost()` / `memory_bytes_cost()`) and asserts the
+measurement stays under a recorded ceiling.
+
+### Running the Suite
+
+```bash
+cargo test -p treasury-contract -- budget_test
+```
+
+Every measurement is taken after `budget().reset_unlimited()`, so the host's own
+consumption limit cannot truncate a run, and the meter is read immediately before
+and after the call under test so nothing outside it contributes.
+
+### What Each Path Is Measured On
+
+| Shape | Meaning |
+| --- | --- |
+| common | The typical call, with resources already set up. |
+| worst-case supported | The heaviest *accepted* call — the largest amount the guards allow, with the optional quota configured so the whole path runs instead of its fail-open shortcut. |
+| rejected over-limit | The call the guards must turn away, which an attacker can force for free. |
+
+### Recorded Thresholds
+
+Raw host measurements at the commit that added the suite, `soroban-sdk 21.7.7`.
+`HEADROOM_PERCENT` in `budget_test.rs` (currently 5%) is applied on top of these
+by `limit()` before comparison, so the effective ceiling is the raw value plus
+5%.
+
+| Constant | Path | Raw CPU instructions | Raw memory bytes |
+| --- | --- | ---: | ---: |
+| `WITHDRAW_COMMON` | `withdraw`, 200 of a 1,000 limit | 250,480 | 33,764 |
+| `WITHDRAW_WORST_SUPPORTED` | `withdraw`, full 1,000 limit, `wdraw` quota configured | 313,531 | 45,844 |
+| `WITHDRAW_REJECTED_OVER_LIMIT` | `withdraw`, 1,001 — rejected before auth | 21,999 | 3,934 |
+| `DEPOSIT_COMMON` | `deposit`, 500 | 357,448 | 48,054 |
+| `DEPOSIT_REJECTED_ZERO` | `deposit`, 0 — rejected before auth | 15,767 | 2,582 |
+| `DISTRIBUTE_REWARD_COMMON` | `distribute_reward`, 400 via the referral contract | 232,471 | 30,249 |
+| `DISTRIBUTE_REWARD_REJECTED_OVER_BALANCE` | `distribute_reward`, 1,001 against a 1,000 balance | 43,594 | 7,032 |
+| `EMERGENCY_WITHDRAW_COMMON` | `emergency_withdraw`, 200 while paused | 220,322 | 30,062 |
+| `EMERGENCY_WITHDRAW_REJECTED_NOT_PAUSED` | `emergency_withdraw` while not paused | 23,258 | 4,016 |
+
+Two invariants are asserted on top of the table, so a stale row cannot stay
+silent:
+
+* every rejection row must be **strictly cheaper** than the accepted row beside
+  it — that property is the whole point of the validation ordering, and it is
+  what breaks first if a guard moves after a storage write;
+* the quota-configured withdrawal must cost **more** than the plain one,
+  otherwise the "worst case" row is measuring the fail-open shortcut by accident.
+
+`every_threshold_has_been_measured` additionally fails while any row is still
+zeroed, so a half-filled table cannot be merged.
+
+### Updating a Threshold
+
+Raising a ceiling is a deliberate act, not a fix for a red build:
+
+1. Run `cargo test -p treasury-contract -- budget_test`.
+2. Read the measured value out of the failure message — it reports CPU and memory
+   for the path that failed.
+3. Confirm the increase is intended (a new event, an extra audit write, a wider
+   loop) and not an accidental reordering that moved work ahead of a guard.
+4. Set the constant in `contracts/treasury-contract/src/budget_test.rs` to the
+   measured value and record the reason in the pull request description.
+
+A few percent of drift after a `soroban-sdk` patch bump is absorbed by
+`HEADROOM_PERCENT`. A genuine regression on these paths shows up as a multiple,
+not as single digits.
+
+### Fixture Caveats
+
+Two constraints the suite has to respect, worth knowing before extending it:
+
+* `deposit` calls `token::Client::transfer`, so the fixture token must be a real
+  stellar-asset contract (`env.register_stellar_asset_contract_v2`). A bare
+  `Address::generate` aborts it with a host error — and with it every withdrawal
+  path, which needs a category balance to withdraw from.
+* `set_referral_contract` calls `admin.require_auth()` twice in one invocation
+  (once through `require_admin`, once through `grant_role`). The host's
+  recording-auth mode (`Env::mock_all_auths`) rejects the second call with
+  `Error(Auth, ExistingValue)`, so the suite registers the referral contract by
+  writing the same two storage entries directly — see `register_referral` in
+  `budget_test.rs`.
 
 ## Soroban Cost Reference
 
