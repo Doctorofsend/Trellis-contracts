@@ -3737,6 +3737,7 @@ This repository contains comprehensive documentation for contract design, gas op
 - [**GAS_OPTIMIZATION.md**](GAS_OPTIMIZATION.md) — Gas optimization principles, applied optimizations, benchmark infrastructure, and a checklist for new features.
 - [**SECURITY_BATCH.md**](SECURITY_BATCH.md) — Security analysis of batch operations including reentrancy protection, input validation, and failure semantics.
 - [**docs/IMPORT_PIPELINE.md**](docs/IMPORT_PIPELINE.md) — Bulk import pipeline with pre-flight dry-run validation, duplicate detection, and prescriptive rollback guidance.
+- [**docs/PREFLIGHT.md**](docs/PREFLIGHT.md) — Deterministic pre-submission preflight for high-risk operations with ready/warning/blocked verdicts, remediation steps, and shared error mapping.
 
 ## Module Documentation
 

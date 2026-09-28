@@ -30,6 +30,7 @@ pub mod migration;
 pub mod pagination;
 pub mod payments;
 pub mod policy;
+pub mod preflight;
 pub mod quota;
 pub mod reconciliation;
 pub mod recovery;
@@ -179,6 +180,11 @@ pub use import::{
     validate_config as validate_import_config, DuplicatePolicy, ImportError, ImportConfig,
     ImportItem, ImportMode, ImportReport, RollbackGuidance, RowError, StoredImportRecord,
     ABSOLUTE_MAX_IMPORT_SIZE, DEFAULT_MAX_IMPORT_SIZE, MAX_EXTERNAL_ID_LEN,
+};
+pub use preflight::{
+    preflight, require_preflight, requires_preflight, PreflightCheck, PreflightCode,
+    PreflightInput, PreflightOperation, PreflightReport, PreflightStatus, RiskLevel,
+    EXPIRY_WARNING_WINDOW_LEDGERS, HIGH_VALUE_WARNING_BPS,
 };
 
 #[cfg(test)]

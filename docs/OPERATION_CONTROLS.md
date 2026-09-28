@@ -34,6 +34,16 @@ Use `shared::semantic` before storage writes and cross-contract calls:
 - `validate_distinct_parties` for donor/recipient, buyer/seller, and caller/target checks.
 - `validate_future_expiry` for bounded future ledger windows.
 
+## Transaction Preflight
+
+Run `shared::preflight` before signing or submitting a high-risk operation
+(treasury withdrawal, escrow release/refund, upgrade, migration resume,
+rebalance, batch invoke). `preflight` is a pure function of typed facts — it
+returns `Ready`, `Warning`, or `Blocked` checks with a user-safe message and a
+remediation step, and `require_preflight` guards an entry point with the shared
+error codes. See [`docs/PREFLIGHT.md`](./PREFLIGHT.md) for the full check table
+and determinism notes.
+
 ## Dependency Health
 
 Use `shared::health` to publish contract-visible assumptions about external
