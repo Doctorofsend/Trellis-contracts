@@ -211,3 +211,12 @@ mod test_pagination;
 mod test_client;
 #[cfg(test)]
 mod test_import;
+
+// Deterministic ledger-sequence harness controls (Issue #156). Test-only: the
+// harness sets the ledger sequence/timestamp explicitly and never reads the
+// host clock, so boundary tests are reproducible.
+#[cfg(test)]
+pub mod ledger_sequence;
+
+#[cfg(test)]
+mod test_ledger_sequence;
