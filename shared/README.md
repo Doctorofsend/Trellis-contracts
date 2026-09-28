@@ -16,36 +16,31 @@ shared::Error
 shared::errors::Error
 ```
 
-## Reserved ranges
+## Error-code namespaces
 
-Each contract module owns a separate numeric range. Numeric codes must not be
-reused for a different meaning, even when an older variant is no longer used.
+Numeric codes are stable within an error domain. Never change or reuse a
+published value. The source enums are `shared::errors::Error`, each contract's
+local `#[contracterror]` enum, and `shared::batch::BatchError`.
 
-| Range | Owner | Purpose |
-|---|---|---|
-| `100-199` | Aid contract | Aid distribution and claim-specific errors |
-| `200-299` | Treasury contract | Balance, transfer, and treasury-specific errors |
-| `300-399` | Referral contract | Referral and reward-specific errors |
-| `400-499` | Governance contract | Proposal, vote, and governance-specific errors |
-| `500-599` | Oracle contract | Price feed and oracle-specific errors |
-| `600-699` | Registry contract | Registration and registry-specific errors |
-| `700-899` | Reserved | Reserved for future contract modules |
-| `900-999` | Shared/common | Errors with the same meaning across contracts |
+| Domain / enum | Numeric codes | Notes |
+|---|---:|---|
+| `Shared` / `Error` | `1-28` | Common authorization, validation, state, and configuration errors (reserved values are not assigned). |
+| `Aid` / `AidError` | `100-107` | Aid lifecycle and authorization errors. |
+| `AccessControl` / `AccessControlError` | `200-214` | Roles, invitations, authorization, and rate limiting. |
+| `Oracle` / `OracleError` | `500-510` | Feed, submitter, freshness, and validation errors. |
+| `Payments` / `Error` | `700-711` | Payment and escrow errors. |
+| `Batch` / `BatchError` | `800-805` | Bounded multi-operation execution. |
+| `Upgradeability` / `UpgradeError` | `900-911` | Upgrade registry, proposal, validation, and migration failures. |
+| `Import` / `ImportError` | `940-948` | Import validation and execution. |
+| `Shared` / `Error` | `950-952` | Aid compatibility errors retained in the shared enum. |
+| `Shared` / `Error` | `1000-1008` | Marketplace compatibility aliases retained in the shared enum. |
+| `Marketplace` / `MarketError` | `2000-2023` | Marketplace-local errors. |
 
-## Shared error table
-
-| Code | Variant | Meaning |
-|---:|---|---|
-| `900` | `NotAuthorized` | The caller is not authorized to perform the operation |
-| `901` | `AlreadyInitialized` | The contract or component was already initialized |
-| `902` | `NotInitialized` | The contract or component has not been initialized |
-| `903` | `InvalidAmount` | The supplied amount is invalid |
-| `904` | `Expired` | The operation or resource has expired |
-| `905` | `AlreadyClaimed` | The resource or entitlement was already claimed |
-| `906` | `Paused` | The operation is disabled while the contract is paused |
-| `907` | `Overflow` | An arithmetic operation exceeded its supported range |
-| `908` | `InvalidInput` | One or more input values are invalid |
-| `909` | `NotFound` | The requested resource could not be found |
+`ErrorDomain` disambiguates overlapping or legacy numeric spaces. `describe_error`
+maps supported domain/code pairs to a stable public string, category,
+retryability, safe message, and recovery guidance. Add a mapping and update the
+coverage test whenever a contract error is added. Unrecognized pairs use the
+safe `UNEXPECTED_ERROR` fallback.
 
 ## Usage
 
@@ -55,7 +50,7 @@ Contracts can import and return the re-exported enum directly:
 use shared::Error;
 
 pub fn example() -> Result<(), Error> {
-    Err(Error::InvalidInput)
+    Err(Error::InvalidArgument)
 }
 ```
 
@@ -69,8 +64,8 @@ than once.
 2. Never assign the same numeric value to multiple variants.
 3. Put module-specific errors inside the module's assigned range.
 4. Use the `900-999` range only for errors shared by multiple contracts.
-5. Update this document whenever a new error code is introduced.
-6. Update the uniqueness and stability tests when adding a shared variant.
+5. Update `docs/ERRORS.md` and this catalog whenever a public error is introduced.
+6. Add/extend the exhaustive mapping test for the affected error domain.
 
 ## Compatibility, quota, and config helpers
 

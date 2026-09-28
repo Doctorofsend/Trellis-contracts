@@ -187,11 +187,12 @@ pub fn format_client_error(
     correlation_id: BytesN<32>,
 ) -> ClientErrorResponse {
     let info = describe_error(env, domain.clone(), code, correlation_id.clone());
-    
+
     let domain_sym = match domain {
         ErrorDomain::Shared => symbol_short!("shared"),
         ErrorDomain::Aid => symbol_short!("aid"),
         ErrorDomain::Payments => symbol_short!("pay"),
+        ErrorDomain::Batch => symbol_short!("batch"),
         ErrorDomain::Governance => symbol_short!("gov"),
         ErrorDomain::Marketplace => symbol_short!("mkt"),
         ErrorDomain::Oracle => symbol_short!("oracle"),

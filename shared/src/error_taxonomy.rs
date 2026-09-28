@@ -12,6 +12,7 @@ pub enum ErrorDomain {
     AccessControl,
     Treasury,
     Payments,
+    Batch,
     Governance,
     Referral,
     Registry,
@@ -110,7 +111,8 @@ fn shared_definition(code: u32) -> Option<Definition> {
             || x == E::InvalidRoyaltyRate as u32
             || x == E::InvalidExtensionWindow as u32
             || x == E::InvalidTransition as u32
-            || x == E::InvalidMigrationHook as u32 =>
+            || x == E::InvalidMigrationHook as u32
+            || x == E::PaymentTokenNotSupported as u32 =>
         {
             definition(
                 "VALIDATION_FAILED",
@@ -520,6 +522,51 @@ fn domain_definition(domain: &ErrorDomain, code: u32) -> Option<Definition> {
             "Settlement confirmation was not received.",
             Some("Retry the pending settlement without submitting another transfer."),
         )),
+        ErrorDomain::Batch => Some(match code {
+            800 => definition(
+                "BATCH_TOO_LARGE",
+                ErrorCategory::Validation,
+                false,
+                "The batch exceeds the maximum number of operations.",
+                Some("Split the operations into smaller batches and retry."),
+            ),
+            801 => definition(
+                "BATCH_OPERATION_FAILED",
+                ErrorCategory::Settlement,
+                false,
+                "An operation in the atomic batch failed; the batch was rolled back.",
+                Some("Inspect the target operation and retry after correcting its cause."),
+            ),
+            802 => definition(
+                "BATCH_CONFIG_INVALID",
+                ErrorCategory::Configuration,
+                false,
+                "The batch configuration is invalid.",
+                Some("Set the operation limit within the supported range."),
+            ),
+            803 => definition(
+                "BATCH_OPERATION_INVALID",
+                ErrorCategory::Validation,
+                false,
+                "An operation in the batch contains invalid arguments.",
+                Some("Correct the operation inputs and submit the batch again."),
+            ),
+            804 => definition(
+                "BATCH_EMPTY",
+                ErrorCategory::Validation,
+                false,
+                "The batch contains no operations.",
+                Some("Include at least one operation."),
+            ),
+            805 => definition(
+                "BATCH_REENTRANCY_DETECTED",
+                ErrorCategory::Conflict,
+                false,
+                "A batch operation is already in progress.",
+                Some("Wait for the current operation to finish before retrying."),
+            ),
+            _ => return None,
+        }),
         ErrorDomain::Import => Some(match code {
             940 => definition(
                 "BATCH_TOO_LARGE",
@@ -627,6 +674,7 @@ pub fn describe_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batch::BatchError;
 
     fn correlation_id(env: &Env) -> BytesN<32> {
         BytesN::from_array(env, &[0x42; 32])
@@ -720,5 +768,131 @@ mod tests {
         assert_eq!(info.category, ErrorCategory::Internal);
         assert!(!info.retryable);
         assert!(info.recovery.is_some());
+    }
+
+    #[test]
+    fn every_shared_error_variant_has_a_stable_catalog_mapping() {
+        let env = Env::default();
+        let codes = [
+            Error::Unauthorized as u32,
+            Error::NotFound as u32,
+            Error::InvalidAmount as u32,
+            Error::Overflow as u32,
+            Error::ContractPaused as u32,
+            Error::Expired as u32,
+            Error::AlreadyClaimed as u32,
+            Error::InsufficientBalance as u32,
+            Error::WithdrawalLimitExceeded as u32,
+            Error::InvalidArgument as u32,
+            Error::NotPaused as u32,
+            Error::ProposalNotFound as u32,
+            Error::AlreadyApproved as u32,
+            Error::BelowThreshold as u32,
+            Error::AlreadyExecuted as u32,
+            Error::ImmutableEntry as u32,
+            Error::InvalidHash as u32,
+            Error::MetadataNotFound as u32,
+            Error::AlreadyInitialized as u32,
+            Error::UnsupportedSchemaVersion as u32,
+            Error::SchemaMigrationFailed as u32,
+            Error::QuotaExceeded as u32,
+            Error::ConfigMissing as u32,
+            Error::ConfigInvalid as u32,
+            Error::UnsafeSecret as u32,
+            Error::ProposalExpired as u32,
+            Error::ProposalCancelled as u32,
+            Error::StaleData as u32,
+            Error::ContractNotRegistered as u32,
+            Error::ContractAlreadyRegistered as u32,
+            Error::NoChangeDetected as u32,
+            Error::UpgradeProposalNotFound as u32,
+            Error::UpgradeAlreadyExecuted as u32,
+            Error::MigrationHookFailed as u32,
+            Error::UpgradeAlreadyPending as u32,
+            Error::NotUpgrader as u32,
+            Error::InvalidWasmHash as u32,
+            Error::StorageIncompatible as u32,
+            Error::InvalidMigrationHook as u32,
+            Error::PaymentInvalidAmount as u32,
+            Error::PaymentInsufficientBalance as u32,
+            Error::PaymentEscrowNotFound as u32,
+            Error::PaymentEscrowAlreadyReleased as u32,
+            Error::PaymentEscrowAlreadyRefunded as u32,
+            Error::PaymentEscrowUnauthorized as u32,
+            Error::PaymentEscrowExpired as u32,
+            Error::PaymentEscrowNotExpired as u32,
+            Error::PaymentInvalidFeeRate as u32,
+            Error::PaymentFeeOverflow as u32,
+            Error::PaymentEscrowIdOverflow as u32,
+            Error::PaymentTokenNotSupported as u32,
+            Error::ListingNotFound as u32,
+            Error::ListingAlreadySold as u32,
+            Error::NotOwner as u32,
+            Error::CollectionAlreadyRegistered as u32,
+            Error::CollectionNotFound as u32,
+            Error::CurrencyNotWhitelisted as u32,
+            Error::InvalidMetadataHash as u32,
+            Error::InvalidRoyaltyRate as u32,
+            Error::InvalidExtensionWindow as u32,
+            Error::InvalidTransition as u32,
+            Error::AidNotExpiredYet as u32,
+            Error::AidAlreadyRefunded as u32,
+        ];
+
+        for raw_code in codes {
+            let info = describe_error(&env, ErrorDomain::Shared, raw_code, correlation_id(&env));
+            assert_ne!(
+                info.code,
+                String::from_str(&env, "UNEXPECTED_ERROR"),
+                "shared error code {raw_code} must be documented"
+            );
+        }
+    }
+
+    #[test]
+    fn every_batch_error_has_a_domain_specific_stable_mapping() {
+        let env = Env::default();
+        let codes = [
+            BatchError::BatchTooLarge as u32,
+            BatchError::OperationFailed as u32,
+            BatchError::InvalidConfig as u32,
+            BatchError::InvalidOperation as u32,
+            BatchError::EmptyBatch as u32,
+            BatchError::ReentrancyDetected as u32,
+        ];
+
+        for raw_code in codes {
+            let info = describe_error(&env, ErrorDomain::Batch, raw_code, correlation_id(&env));
+            assert_ne!(
+                info.code,
+                String::from_str(&env, "UNEXPECTED_ERROR"),
+                "batch error code {raw_code} must be documented"
+            );
+            assert!(info.recovery.is_some());
+        }
+    }
+
+    #[test]
+    fn contract_error_ranges_have_stable_domain_mappings() {
+        let env = Env::default();
+        let ranges = [
+            (ErrorDomain::Aid, 100, 107),
+            (ErrorDomain::AccessControl, 200, 214),
+            (ErrorDomain::Oracle, 500, 510),
+            (ErrorDomain::Upgradeability, 900, 911),
+            (ErrorDomain::Import, 940, 948),
+            (ErrorDomain::Marketplace, 2000, 2023),
+        ];
+
+        for (domain, first, last) in ranges {
+            for raw_code in first..=last {
+                let info = describe_error(&env, domain.clone(), raw_code, correlation_id(&env));
+                assert_ne!(
+                    info.code,
+                    String::from_str(&env, "UNEXPECTED_ERROR"),
+                    "error code {raw_code} in {domain:?} must be documented"
+                );
+            }
+        }
     }
 }
