@@ -338,6 +338,8 @@ mod tests {
             registry.try_set_contract(&attacker, &name, &treasury, &1_u32),
             Err(Ok(Error::Unauthorized))
         ));
+        assert!(registry.list_names().is_empty());
+        assert_eq!(registry.try_get_contract(&name), Err(Ok(Error::NotFound)));
     }
 
     // ===========================================================================
@@ -503,6 +505,59 @@ mod tests {
             ),
             Err(Ok(Error::InvalidHash))
         ));
+    }
+
+    #[test]
+    fn malformed_metadata_payloads_do_not_partially_mutate_storage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let registry_id = env.register_contract(None, RegistryContract);
+        let admin = Address::generate(&env);
+        let registry = RegistryContractClient::new(&env, &registry_id);
+        registry.initialize(&admin);
+
+        let name = Symbol::new(&env, "payload_test");
+        let original_uri = Bytes::from_slice(&env, b"ipfs://QmOriginal");
+        let original_hash = create_test_hash(&env);
+        registry.set_metadata(&admin, &name, &original_uri, &original_hash, &false, &1);
+
+        let mut oversized_uri = Bytes::new(&env);
+        for _ in 0..=shared::sanitize::MAX_URL_LEN {
+            oversized_uri.push_back(b'a');
+        }
+        assert_eq!(
+            registry.try_set_metadata(&admin, &name, &oversized_uri, &original_hash, &false, &1),
+            Err(Ok(Error::InvalidArgument))
+        );
+        let unchanged = registry.get_metadata(&name);
+        assert_eq!(unchanged.uri, original_uri);
+        assert_eq!(unchanged.hash, original_hash);
+
+        let unsafe_uri = Bytes::from_slice(&env, b"javascript:alert(1)");
+        assert_eq!(
+            registry.try_set_metadata(&admin, &name, &unsafe_uri, &original_hash, &false, &1),
+            Err(Ok(Error::InvalidArgument))
+        );
+        assert_eq!(registry.get_metadata(&name), unchanged);
+
+        let malformed_name = Symbol::new(&env, "bad_hash");
+        let malformed_hash = Bytes::from_slice(&env, b"short");
+        assert_eq!(
+            registry.try_set_metadata(
+                &admin,
+                &malformed_name,
+                &original_uri,
+                &malformed_hash,
+                &false,
+                &1
+            ),
+            Err(Ok(Error::InvalidHash))
+        );
+        assert_eq!(
+            registry.try_get_metadata(&malformed_name),
+            Err(Ok(Error::MetadataNotFound))
+        );
+        assert_eq!(registry.list_metadata_entries().len(), 1);
     }
 
     #[test]
