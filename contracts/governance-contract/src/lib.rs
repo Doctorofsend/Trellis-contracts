@@ -35,6 +35,8 @@ const DEFAULT_REFERRAL_MAX_TIERS: i128 = 3;
 const MIN_REFERRAL_REWARD_CAP: i128 = 0;
 const MAX_REFERRAL_REWARD_CAP: i128 = 1_000_000_000_000_000_000;
 const DEFAULT_REFERRAL_REWARD_CAP: i128 = 10_000_000_000;
+/// Maximum signers accepted in a single multi-signature operation.
+pub const MAX_GOVERNANCE_ADMINS: u32 = 20;
 /// Proposals are actionable for 30 days after creation.
 pub const PROPOSAL_LIFETIME: u64 = 30 * 24 * 60 * 60;
 
@@ -158,7 +160,7 @@ impl GovernanceContract {
         if threshold < 1 {
             return Err(Error::InvalidArgument);
         }
-        if admin_set.len() < threshold {
+        if admin_set.len() < threshold || admin_set.len() > MAX_GOVERNANCE_ADMINS {
             return Err(Error::InvalidArgument);
         }
 
@@ -248,7 +250,10 @@ impl GovernanceContract {
         new_threshold: u32,
     ) -> Result<(), Error> {
         require_admin_role(&env, &caller)?;
-        if new_threshold < 1 || new_admin_set.len() < new_threshold {
+        if new_threshold < 1
+            || new_admin_set.len() < new_threshold
+            || new_admin_set.len() > MAX_GOVERNANCE_ADMINS
+        {
             return Err(Error::InvalidArgument);
         }
         instance_set(&env, &KEY_THRESHOLD, &new_threshold);
@@ -636,6 +641,8 @@ fn role_name(role: &Role) -> Symbol {
         Role::Pauser => symbol_short!("pauser"),
         Role::ReferralManager => symbol_short!("refrl_m"),
         Role::OracleSigner => symbol_short!("oracle_s"),
+        Role::EndUser => symbol_short!("end_user"),
+        Role::ServiceActor => symbol_short!("svc_actor"),
     }
 }
 
@@ -687,7 +694,7 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
     use soroban_sdk::{Env, IntoVal, TryFromVal};
 
     /// Creates a 2-of-2 governance setup. Returns (env, client, admin).
@@ -761,6 +768,23 @@ mod tests {
         admin_set.push_back(admin.clone());
         let result = client.try_initialize(&admin, &2, &admin_set);
         assert_eq!(result, Err(Ok(Error::InvalidArgument)));
+    }
+
+    #[test]
+    fn initialize_rejects_admin_set_over_the_iteration_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, GovernanceContract);
+        let client = GovernanceContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let admin_set = make_admin_set(&env, MAX_GOVERNANCE_ADMINS as usize + 1);
+
+        assert_eq!(
+            client.try_initialize(&admin, &1, &admin_set),
+            Err(Ok(Error::InvalidArgument))
+        );
+        assert_eq!(client.get_admin_set().len(), 0);
+        assert_eq!(client.get_threshold(), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -947,11 +971,14 @@ mod tests {
         );
         assert_eq!(
             client.get_proposal(&proposal_id).status,
-            ProposalStatus::Expired
+            // The failing invocation is rolled back by Soroban, so the
+            // stored proposal remains pending; its expiry is checked again
+            // on the next state-changing call.
+            ProposalStatus::Pending
         );
         assert_eq!(
             client.try_execute(&second_admin, &proposal_id),
-            Err(Ok(Error::ProposalCancelled))
+            Err(Ok(Error::ProposalExpired))
         );
     }
 
@@ -1148,6 +1175,21 @@ mod tests {
         let new_admins = make_admin_set(&env, 2);
         let result = client.try_set_admin_set(&admin, &new_admins, &3);
         assert_eq!(result, Err(Ok(Error::InvalidArgument)));
+    }
+
+    #[test]
+    fn set_admin_set_rejects_over_limit_without_changing_current_configuration() {
+        let (env, client, admin) = setup();
+        let previous_admins = client.get_admin_set();
+        let previous_threshold = client.get_threshold();
+        let oversized = make_admin_set(&env, MAX_GOVERNANCE_ADMINS as usize + 1);
+
+        assert_eq!(
+            client.try_set_admin_set(&admin, &oversized, &1),
+            Err(Ok(Error::InvalidArgument))
+        );
+        assert_eq!(client.get_admin_set(), previous_admins);
+        assert_eq!(client.get_threshold(), previous_threshold);
     }
 
     // -----------------------------------------------------------------------
