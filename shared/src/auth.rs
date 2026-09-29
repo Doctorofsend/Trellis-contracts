@@ -122,6 +122,178 @@ pub fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
     Ok(())
 }
 
+pub const KEY_PENDING_OWNER: Symbol = symbol_short!("pend_own");
+
+/// Pending ownership transfer record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingOwnershipTransfer {
+    pub current_owner: Address,
+    pub target_owner: Address,
+    pub expiry: u64,
+}
+
+/// Returns the currently pending ownership transfer, if one exists.
+pub fn get_pending_ownership_transfer(env: &Env) -> Option<PendingOwnershipTransfer> {
+    env.storage().instance().get(&KEY_PENDING_OWNER)
+}
+
+/// Proposes an ownership transfer to `target_owner` with an `expiry` timestamp.
+/// The caller must be the current admin.
+///
+/// Returns `Err(Error::Unauthorized)` if the caller is not the admin.
+/// Returns `Err(Error::InvalidArgument)` if `expiry <= current_timestamp` or `target_owner == current_owner`.
+/// Returns `Err(Error::TransferAlreadyPending)` if an unexpired transfer is already pending.
+pub fn propose_ownership_transfer(
+    env: &Env,
+    current_owner: &Address,
+    target_owner: &Address,
+    expiry: u64,
+) -> Result<(), Error> {
+    require_admin(env, current_owner)?;
+
+    let now = env.ledger().timestamp();
+    if expiry <= now {
+        return Err(Error::InvalidArgument);
+    }
+    if *target_owner == *current_owner {
+        return Err(Error::InvalidArgument);
+    }
+
+    if let Some(existing) = get_pending_ownership_transfer(env) {
+        if now <= existing.expiry {
+            return Err(Error::TransferAlreadyPending);
+        }
+    }
+
+    let transfer = PendingOwnershipTransfer {
+        current_owner: current_owner.clone(),
+        target_owner: target_owner.clone(),
+        expiry,
+    };
+
+    env.storage().instance().set(&KEY_PENDING_OWNER, &transfer);
+
+    let before_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[0]))
+        .into();
+    let after_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[1]))
+        .into();
+    crate::history::record_mutation(
+        env,
+        symbol_short!("admin"),
+        current_owner.clone(),
+        Symbol::new(env, "prop_own"),
+        before_hash,
+        after_hash,
+    );
+
+    env.events().publish(
+        (symbol_short!("auth"), symbol_short!("own_prop")),
+        (current_owner.clone(), target_owner.clone(), expiry),
+    );
+
+    Ok(())
+}
+
+/// Accepts a pending ownership transfer. Caller must be the designated `target_owner`.
+///
+/// Returns `Err(Error::NoPendingTransfer)` if no transfer is pending.
+/// Returns `Err(Error::NotPendingOwner)` if `caller != target_owner`.
+/// Returns `Err(Error::TransferExpired)` if the transfer has expired.
+pub fn accept_ownership_transfer(env: &Env, caller: &Address) -> Result<(), Error> {
+    caller.require_auth();
+
+    let transfer = get_pending_ownership_transfer(env).ok_or(Error::NoPendingTransfer)?;
+
+    if *caller != transfer.target_owner {
+        return Err(Error::NotPendingOwner);
+    }
+
+    let now = env.ledger().timestamp();
+    if now > transfer.expiry {
+        env.storage().instance().remove(&KEY_PENDING_OWNER);
+        return Err(Error::TransferExpired);
+    }
+
+    env.storage().instance().remove(&KEY_PENDING_OWNER);
+
+    // Update stored admin address
+    set_admin(env, caller);
+
+    // Grant Admin role to new owner
+    persistent_set(env, &DataKey::Role(caller.clone(), Role::Admin), &true);
+
+    // Revoke Admin role from old owner
+    persistent_remove(
+        env,
+        &DataKey::Role(transfer.current_owner.clone(), Role::Admin),
+    );
+
+    let before_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[0]))
+        .into();
+    let after_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[1]))
+        .into();
+    crate::history::record_mutation(
+        env,
+        symbol_short!("admin"),
+        caller.clone(),
+        Symbol::new(env, "acpt_own"),
+        before_hash,
+        after_hash,
+    );
+
+    env.events().publish(
+        (symbol_short!("auth"), symbol_short!("own_acpt")),
+        (transfer.current_owner, caller.clone()),
+    );
+
+    Ok(())
+}
+
+/// Cancels an active pending ownership transfer. Caller must be the current admin.
+///
+/// Returns `Err(Error::Unauthorized)` if caller is not the admin.
+/// Returns `Err(Error::NoPendingTransfer)` if no transfer is pending.
+pub fn cancel_ownership_transfer(env: &Env, caller: &Address) -> Result<(), Error> {
+    require_admin(env, caller)?;
+
+    let transfer = get_pending_ownership_transfer(env).ok_or(Error::NoPendingTransfer)?;
+
+    env.storage().instance().remove(&KEY_PENDING_OWNER);
+
+    let before_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[1]))
+        .into();
+    let after_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[0]))
+        .into();
+    crate::history::record_mutation(
+        env,
+        symbol_short!("admin"),
+        caller.clone(),
+        Symbol::new(env, "canc_own"),
+        before_hash,
+        after_hash,
+    );
+
+    env.events().publish(
+        (symbol_short!("auth"), symbol_short!("own_canc")),
+        (caller.clone(), transfer.target_owner),
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Role storage helpers
 // ---------------------------------------------------------------------------
@@ -148,11 +320,17 @@ pub fn grant_role(
 ) -> Result<(), Error> {
     require_admin(env, admin_caller)?;
     let key = DataKey::Role(user.clone(), role.clone());
-    
+
     // Hash based on state (false -> true)
-    let before_hash = env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[0])).into();
-    let after_hash = env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[1])).into();
-    
+    let before_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[0]))
+        .into();
+    let after_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[1]))
+        .into();
+
     crate::history::record_mutation(
         env,
         soroban_sdk::symbol_short!("role"),
@@ -161,7 +339,7 @@ pub fn grant_role(
         before_hash,
         after_hash,
     );
-    
+
     persistent_set(env, &key, &true);
     Ok(())
 }
@@ -183,9 +361,15 @@ pub fn revoke_role(
     require_admin(env, admin_caller)?;
     let key = DataKey::Role(user.clone(), role.clone());
     if persistent_has(env, &key) {
-        let before_hash = env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[1])).into();
-        let after_hash = env.crypto().sha256(&soroban_sdk::Bytes::from_slice(env, &[0])).into();
-        
+        let before_hash = env
+            .crypto()
+            .sha256(&soroban_sdk::Bytes::from_slice(env, &[1]))
+            .into();
+        let after_hash = env
+            .crypto()
+            .sha256(&soroban_sdk::Bytes::from_slice(env, &[0]))
+            .into();
+
         crate::history::record_mutation(
             env,
             soroban_sdk::symbol_short!("role"),

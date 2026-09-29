@@ -1,7 +1,7 @@
 use soroban_sdk::{contracttype, symbol_short, Env, String, Symbol, Vec};
 
 use crate::health::{list_dependency_health, DependencyStatus};
-use crate::jobs::{list_dead_letters, is_retryable_error};
+use crate::jobs::{is_retryable_error, list_dead_letters};
 use crate::reconciliation::{run_reconciliation, SourceRecord};
 
 // ---------------------------------------------------------------------------
@@ -267,7 +267,7 @@ pub fn create_partial_failure(
     let now_ledger = env.ledger().sequence();
     let age_ledgers = now_ledger.saturating_sub(failed_at_ledger);
     let is_retryable = is_retryable_error(error_code);
-    
+
     let severity = classify_severity(error_code, operation_type, age_ledgers);
     let state = if is_retryable {
         FailureState::Retryable
@@ -321,7 +321,10 @@ fn classify_severity(
     }
 
     // High severity for payment/transfer operations
-    if matches!(operation_type, OperationType::Payment | OperationType::Transfer) {
+    if matches!(
+        operation_type,
+        OperationType::Payment | OperationType::Transfer
+    ) {
         return FailureSeverity::High;
     }
 
@@ -348,7 +351,7 @@ pub fn redact_partial_failure(env: &Env, failure: &PartialFailure) -> RedactedPa
     };
 
     let inspect_link = String::from_str(env, "api/inspect/{id}");
-    
+
     let remediation_link = match failure.state {
         FailureState::Unresolved => String::from_str(env, "docs/remediation/unresolved"),
         FailureState::Retryable => String::from_str(env, "docs/remediation/retryable"),
@@ -376,12 +379,9 @@ pub fn redact_partial_failure(env: &Env, failure: &PartialFailure) -> RedactedPa
 }
 
 /// Groups partial failures by operation type.
-pub fn group_by_operation_type(
-    env: &Env,
-    failures: &Vec<PartialFailure>,
-) -> Vec<FailureGroup> {
+pub fn group_by_operation_type(env: &Env, failures: &Vec<PartialFailure>) -> Vec<FailureGroup> {
     let mut groups = Vec::new(env);
-    
+
     let operation_types = [
         OperationType::Payment,
         OperationType::Transfer,
@@ -412,7 +412,7 @@ pub fn group_by_operation_type(
         if count > 0 {
             let type_symbol = operation_type_to_symbol(op_type);
             groups.push_back(FailureGroup {
-                dimension: symbol_short!("operation_type"),
+                dimension: Symbol::new(env, "operation_type"),
                 value: type_symbol,
                 count,
                 critical_count,
@@ -428,7 +428,7 @@ pub fn group_by_operation_type(
 /// Groups partial failures by severity.
 pub fn group_by_severity(env: &Env, failures: &Vec<PartialFailure>) -> Vec<FailureGroup> {
     let mut groups = Vec::new(env);
-    
+
     let severities = [
         FailureSeverity::Critical,
         FailureSeverity::High,
@@ -477,7 +477,7 @@ pub fn group_by_age(env: &Env, failures: &Vec<PartialFailure>) -> Vec<FailureGro
     let mut fresh_count = 0u32;
     let mut fresh_critical = 0u32;
     let mut fresh_retryable = 0u32;
-    
+
     let mut stale_count = 0u32;
     let mut stale_critical = 0u32;
     let mut stale_retryable = 0u32;
@@ -530,10 +530,10 @@ pub fn group_by_age(env: &Env, failures: &Vec<PartialFailure>) -> Vec<FailureGro
 /// Groups partial failures by retryability.
 pub fn group_by_retryability(env: &Env, failures: &Vec<PartialFailure>) -> Vec<FailureGroup> {
     let mut groups = Vec::new(env);
-    
+
     let mut retryable_count = 0u32;
     let mut retryable_critical = 0u32;
-    
+
     let mut non_retryable_count = 0u32;
     let mut non_retryable_critical = 0u32;
 
@@ -553,7 +553,7 @@ pub fn group_by_retryability(env: &Env, failures: &Vec<PartialFailure>) -> Vec<F
 
     if retryable_count > 0 {
         groups.push_back(FailureGroup {
-            dimension: symbol_short!("retryability"),
+            dimension: Symbol::new(env, "retryability"),
             value: symbol_short!("retryable"),
             count: retryable_count,
             critical_count: retryable_critical,
@@ -564,8 +564,8 @@ pub fn group_by_retryability(env: &Env, failures: &Vec<PartialFailure>) -> Vec<F
 
     if non_retryable_count > 0 {
         groups.push_back(FailureGroup {
-            dimension: symbol_short!("retryability"),
-            value: symbol_short!("non_retryable"),
+            dimension: Symbol::new(env, "retryability"),
+            value: Symbol::new(env, "non_retryable"),
             count: non_retryable_count,
             critical_count: non_retryable_critical,
             retryable_count: 0,
@@ -583,8 +583,8 @@ fn operation_type_to_symbol(op_type: &OperationType) -> Symbol {
         OperationType::Transfer => symbol_short!("transfer"),
         OperationType::Worker => symbol_short!("worker"),
         OperationType::Webhook => symbol_short!("webhook"),
-        OperationType::ExternalApi => symbol_short!("external_api"),
-        OperationType::DatabaseSync => symbol_short!("database_sync"),
+        OperationType::ExternalApi => symbol_short!("ext_api"),
+        OperationType::DatabaseSync => symbol_short!("db_sync"),
         OperationType::Contract => symbol_short!("contract"),
     }
 }
@@ -619,7 +619,7 @@ pub fn generate_enhanced_dashboard(
     let mut redacted_partial_failures = Vec::new(env);
     for failure in partial_failures.iter() {
         if failure.state != FailureState::Resolved {
-            redacted_partial_failures.push_back(redact_partial_failure(env, failure));
+            redacted_partial_failures.push_back(redact_partial_failure(env, &failure));
         }
     }
 

@@ -64,6 +64,16 @@ pub enum AccessControlError {
     InvalidPauseScope = 216,
     /// The operation is not currently paused.
     NotPaused = 217,
+    /// No pending ownership transfer exists.
+    NoPendingTransfer = 218,
+    /// The pending ownership transfer has expired.
+    TransferExpired = 219,
+    /// Caller is not the designated pending owner.
+    NotPendingOwner = 220,
+    /// An ownership transfer is already pending.
+    TransferAlreadyPending = 221,
+    /// Invalid expiry timestamp.
+    InvalidExpiry = 222,
 }
 
 type ContractResult<T> = core::result::Result<T, AccessControlError>;
@@ -76,12 +86,11 @@ const PAUSE_SCOPE_ADMINS: Symbol = symbol_short!("admins");
 const PAUSE_SCOPE_INVITES: Symbol = symbol_short!("invites");
 
 fn is_valid_pause_scope(scope: &Symbol) -> bool {
-    *scope == PAUSE_SCOPE_ROLES
-        || *scope == PAUSE_SCOPE_ADMINS
-        || *scope == PAUSE_SCOPE_INVITES
+    *scope == PAUSE_SCOPE_ROLES || *scope == PAUSE_SCOPE_ADMINS || *scope == PAUSE_SCOPE_INVITES
 }
 
 /// Fail with [`AccessControlError::OperationPaused`] when `scope` is paused.
+#[allow(dead_code)]
 fn require_not_paused(env: &Env, scope: Symbol) -> ContractResult<()> {
     if env
         .storage()
@@ -125,6 +134,8 @@ enum DataKey {
     PausedBy(Symbol),
     /// Ledger timestamp when a scope was paused: `scope -> u64`.
     PausedAt(Symbol),
+    /// Pending super-admin transfer: `PendingOwnershipTransfer`
+    PendingSuperAdmin,
 }
 
 #[contracttype]
@@ -150,6 +161,9 @@ const EV_INVITE_ACCEPTED: Symbol = symbol_short!("ac_ia");
 const EV_INVITE_REVOKED: Symbol = symbol_short!("ac_ir");
 const EV_PAUSED: Symbol = symbol_short!("ac_pz");
 const EV_RESUMED: Symbol = symbol_short!("ac_rz");
+const EV_OWNERSHIP_TRANSFER_PROPOSED: Symbol = symbol_short!("ac_op");
+const EV_OWNERSHIP_TRANSFER_ACCEPTED: Symbol = symbol_short!("ac_oa");
+const EV_OWNERSHIP_TRANSFER_CANCELLED: Symbol = symbol_short!("ac_oc");
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -226,11 +240,7 @@ impl AccessControlContract {
     /// Requires the `ManageMaintainers` action permission.  Unauthorized
     /// callers receive [`AccessControlError::NotAdmin`].  Unknown scopes
     /// yield [`AccessControlError::InvalidPauseScope`].
-    pub fn pause(
-        env: Env,
-        caller: Address,
-        scope: Symbol,
-    ) -> Result<(), AccessControlError> {
+    pub fn pause(env: Env, caller: Address, scope: Symbol) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::ManageMaintainers)?;
         if !is_valid_pause_scope(&scope) {
             return Err(AccessControlError::InvalidPauseScope);
@@ -274,11 +284,7 @@ impl AccessControlContract {
     /// callers receive [`AccessControlError::NotAdmin`].  Unknown scopes
     /// yield [`AccessControlError::InvalidPauseScope`].  Scopes that are not
     /// currently paused yield [`AccessControlError::NotPaused`].
-    pub fn resume(
-        env: Env,
-        caller: Address,
-        scope: Symbol,
-    ) -> Result<(), AccessControlError> {
+    pub fn resume(env: Env, caller: Address, scope: Symbol) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::ManageMaintainers)?;
         if !is_valid_pause_scope(&scope) {
             return Err(AccessControlError::InvalidPauseScope);
@@ -475,6 +481,203 @@ impl AccessControlContract {
     }
 
     // -----------------------------------------------------------------------
+    // Ownership transfer (Issue #150)
+    // -----------------------------------------------------------------------
+
+    /// Propose a transfer of the super-admin role to `target_owner` with an `expiry` timestamp.
+    /// Only the current super-admin may call this.
+    ///
+    /// # Authorization
+    /// Requires the `TransferOwnership` action permission and caller must be current super-admin.
+    pub fn transfer_ownership(
+        env: Env,
+        caller: Address,
+        target_owner: Address,
+        expiry: u64,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller, &Action::TransferOwnership)?;
+
+        let super_admin_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuperAdmin)
+            .expect("contract not initialised");
+
+        if caller != super_admin_addr {
+            return Err(AccessControlError::NotAdmin);
+        }
+
+        if target_owner == super_admin_addr {
+            return Err(AccessControlError::SelfReference);
+        }
+
+        let now = env.ledger().timestamp();
+        if expiry <= now {
+            return Err(AccessControlError::InvalidExpiry);
+        }
+
+        if let Some(existing) = env
+            .storage()
+            .instance()
+            .get::<DataKey, shared::auth::PendingOwnershipTransfer>(&DataKey::PendingSuperAdmin)
+        {
+            if now <= existing.expiry {
+                return Err(AccessControlError::TransferAlreadyPending);
+            }
+        }
+
+        let pending = shared::auth::PendingOwnershipTransfer {
+            current_owner: caller.clone(),
+            target_owner: target_owner.clone(),
+            expiry,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingSuperAdmin, &pending);
+
+        record_access_audit(
+            &env,
+            &caller,
+            TimelineEventType::RoleChanged,
+            symbol_short!("own_prop"),
+            symbol_short!("transfer"),
+            Some(target_owner.clone()),
+            Some(symbol_short!("super")),
+            Some(0),
+            Some(1),
+        )?;
+
+        env.events().publish(
+            (EV_OWNERSHIP_TRANSFER_PROPOSED,),
+            (caller, target_owner, expiry),
+        );
+        Ok(())
+    }
+
+    /// Accept a pending ownership transfer. Caller must be the designated `target_owner`.
+    pub fn accept_ownership(env: Env, caller: Address) -> Result<(), AccessControlError> {
+        caller.require_auth();
+
+        let pending: shared::auth::PendingOwnershipTransfer = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSuperAdmin)
+            .ok_or(AccessControlError::NoPendingTransfer)?;
+
+        if caller != pending.target_owner {
+            return Err(AccessControlError::NotPendingOwner);
+        }
+
+        let now = env.ledger().timestamp();
+        if now > pending.expiry {
+            env.storage().instance().remove(&DataKey::PendingSuperAdmin);
+            return Err(AccessControlError::TransferExpired);
+        }
+
+        env.storage().instance().remove(&DataKey::PendingSuperAdmin);
+
+        let old_super = pending.current_owner;
+        let new_super = caller.clone();
+
+        // 1. Update super-admin address
+        env.storage()
+            .instance()
+            .set(&DataKey::SuperAdmin, &new_super);
+
+        // 2. Ensure new super-admin is in admins map
+        let mut admins: Map<Address, bool> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admins)
+            .unwrap_or_else(|| Map::new(&env));
+        admins.set(new_super.clone(), true);
+        env.storage().instance().set(&DataKey::Admins, &admins);
+
+        // 3. Grant super role to new super-admin and revoke from old
+        grant_role_internal(&env, &symbol_short!("super"), &new_super);
+        revoke_role_internal(&env, &symbol_short!("super"), &old_super);
+
+        // 4. Update shared auth admin
+        shared::auth::set_admin(&env, &new_super);
+        shared::storage::persistent_set(
+            &env,
+            &shared::auth::DataKey::Role(new_super.clone(), shared::auth::Role::Admin),
+            &true,
+        );
+
+        record_access_audit(
+            &env,
+            &new_super,
+            TimelineEventType::RoleChanged,
+            symbol_short!("own_acpt"),
+            symbol_short!("transfer"),
+            Some(new_super.clone()),
+            Some(symbol_short!("super")),
+            Some(0),
+            Some(1),
+        )?;
+
+        env.events()
+            .publish((EV_OWNERSHIP_TRANSFER_ACCEPTED,), (old_super, new_super));
+        Ok(())
+    }
+
+    /// Cancel a pending ownership transfer. Caller must be the current super-admin.
+    pub fn cancel_ownership_transfer(env: Env, caller: Address) -> Result<(), AccessControlError> {
+        require_action(&env, &caller, &Action::CancelOwnershipTransfer)?;
+
+        let super_admin_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuperAdmin)
+            .expect("contract not initialised");
+
+        if caller != super_admin_addr {
+            return Err(AccessControlError::NotAdmin);
+        }
+
+        let pending: shared::auth::PendingOwnershipTransfer = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSuperAdmin)
+            .ok_or(AccessControlError::NoPendingTransfer)?;
+
+        env.storage().instance().remove(&DataKey::PendingSuperAdmin);
+
+        record_access_audit(
+            &env,
+            &caller,
+            TimelineEventType::RoleChanged,
+            symbol_short!("own_canc"),
+            symbol_short!("transfer"),
+            Some(pending.target_owner.clone()),
+            Some(symbol_short!("super")),
+            Some(1),
+            Some(0),
+        )?;
+
+        env.events().publish(
+            (EV_OWNERSHIP_TRANSFER_CANCELLED,),
+            (caller, pending.target_owner),
+        );
+        Ok(())
+    }
+
+    /// Return the currently pending ownership transfer, if any and not expired.
+    pub fn get_pending_ownership(env: Env) -> Option<shared::auth::PendingOwnershipTransfer> {
+        let pending = env
+            .storage()
+            .instance()
+            .get::<DataKey, shared::auth::PendingOwnershipTransfer>(&DataKey::PendingSuperAdmin)?;
+        if env.ledger().timestamp() > pending.expiry {
+            None
+        } else {
+            Some(pending)
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Role creation
     // -----------------------------------------------------------------------
 
@@ -664,29 +867,41 @@ impl AccessControlContract {
 
         // Rate limiting
         let current_time = env.ledger().timestamp();
-        let last_time = env.storage().instance().get(&DataKey::LastInviteTime(caller.clone())).unwrap_or(0u64);
-        let mut count: u32 = env.storage().instance().get(&DataKey::InviteCount(caller.clone())).unwrap_or(0);
-        
+        let last_time = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastInviteTime(caller.clone()))
+            .unwrap_or(0u64);
+        let mut count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InviteCount(caller.clone()))
+            .unwrap_or(0);
+
         // Reset count if more than 1 hour passed
         if current_time > last_time + 3600 {
             count = 0;
         }
-        
+
         if count >= 10 {
             return Err(AccessControlError::RateLimitExceeded);
         }
-        
-        env.storage().instance().set(&DataKey::LastInviteTime(caller.clone()), &current_time);
-        env.storage().instance().set(&DataKey::InviteCount(caller.clone()), &(count + 1));
+
+        env.storage()
+            .instance()
+            .set(&DataKey::LastInviteTime(caller.clone()), &current_time);
+        env.storage()
+            .instance()
+            .set(&DataKey::InviteCount(caller.clone()), &(count + 1));
 
         let expires_at = current_time + ttl_ledgers; // ttl_ledgers here acts as time in seconds for simplicity
-        
+
         let inv = Invitation {
             inviter: caller.clone(),
             role: role.clone(),
             expires_at,
         };
-        
+
         let invitation_key = DataKey::Invitation(invitee.clone(), role.clone());
         let invitation_exists = env.storage().instance().has(&invitation_key);
         env.storage().instance().set(&invitation_key, &inv);
@@ -701,7 +916,8 @@ impl AccessControlContract {
             Some(if invitation_exists { 1 } else { 0 }),
             Some(1),
         )?;
-        env.events().publish((EV_INVITE_CREATED,), (caller, invitee, role));
+        env.events()
+            .publish((EV_INVITE_CREATED,), (caller, invitee, role));
         Ok(())
     }
 
@@ -712,7 +928,7 @@ impl AccessControlContract {
         role: Symbol,
     ) -> Result<(), AccessControlError> {
         caller.require_auth();
-        
+
         let key = DataKey::Invitation(caller.clone(), role.clone());
         if let Some(inv) = env.storage().instance().get::<DataKey, Invitation>(&key) {
             let current_time = env.ledger().timestamp();
@@ -720,7 +936,7 @@ impl AccessControlContract {
                 env.storage().instance().remove(&key);
                 return Err(AccessControlError::InvitationExpired);
             }
-            
+
             let was_member = has_direct_role(&env, &role, &caller);
             grant_role_internal(&env, &role, &caller);
             env.storage().instance().remove(&key);
@@ -735,8 +951,9 @@ impl AccessControlContract {
                 Some(if was_member { 1 } else { 0 }),
                 Some(1),
             )?;
-            
-            env.events().publish((EV_INVITE_ACCEPTED,), (caller.clone(), role.clone()));
+
+            env.events()
+                .publish((EV_INVITE_ACCEPTED,), (caller.clone(), role.clone()));
             Ok(())
         } else {
             Err(AccessControlError::InvitationNotFound)
@@ -753,7 +970,11 @@ impl AccessControlContract {
         let key = DataKey::Invitation(invitee.clone(), role.clone());
         if let Some(inv) = env.storage().instance().get::<DataKey, Invitation>(&key) {
             // Owner-scoped: a maintainer, or the original inviter, may cancel.
-            require_action(&env, &caller, &Action::CancelInvitation(inv.inviter.clone()))?;
+            require_action(
+                &env,
+                &caller,
+                &Action::CancelInvitation(inv.inviter.clone()),
+            )?;
 
             env.storage().instance().remove(&key);
             record_access_audit(
@@ -767,7 +988,8 @@ impl AccessControlContract {
                 Some(1),
                 Some(0),
             )?;
-            env.events().publish((EV_INVITE_REVOKED,), (caller, invitee, role));
+            env.events()
+                .publish((EV_INVITE_REVOKED,), (caller, invitee, role));
             Ok(())
         } else {
             Err(AccessControlError::InvitationNotFound)
@@ -1081,34 +1303,37 @@ mod tests {
         let client = client_for(&env, &contract_id);
         let role = Symbol::new(&env, "manager");
         let invitee = Address::generate(&env);
-        
+
         client.create_role(&super_admin, &role);
-        
+
         client.create_invitation(&super_admin, &role, &invitee, &3600);
         client.accept_invitation(&invitee, &role);
-        
+
         assert!(client.has_role(&role, &invitee));
     }
-    
+
     #[test]
     fn invitation_expired() {
         let (env, super_admin, contract_id) = setup();
         let client = client_for(&env, &contract_id);
         let role = Symbol::new(&env, "manager");
         let invitee = Address::generate(&env);
-        
+
         client.create_role(&super_admin, &role);
-        
+
         // 0 ttl means expires at current time
         client.create_invitation(&super_admin, &role, &invitee, &0);
-        
+
         // Advance time
         env.ledger().with_mut(|li| {
             li.timestamp = 1;
         });
-        
+
         let result = client.try_accept_invitation(&invitee, &role);
-        assert!(matches!(result, Err(Ok(AccessControlError::InvitationExpired))));
+        assert!(matches!(
+            result,
+            Err(Ok(AccessControlError::InvitationExpired))
+        ));
     }
 
     #[test]
@@ -1118,29 +1343,35 @@ mod tests {
         let role = Symbol::new(&env, "manager");
         let user = Address::generate(&env);
         let invitee = Address::generate(&env);
-        
+
         client.create_role(&super_admin, &role);
-        
+
         let result = client.try_create_invitation(&user, &role, &invitee, &3600);
-        assert!(matches!(result, Err(Ok(AccessControlError::RoleEscalation))));
+        assert!(matches!(
+            result,
+            Err(Ok(AccessControlError::RoleEscalation))
+        ));
     }
-    
+
     #[test]
     fn rate_limit_enforced() {
         let (env, super_admin, contract_id) = setup();
         let client = client_for(&env, &contract_id);
         let role = Symbol::new(&env, "manager");
-        
+
         client.create_role(&super_admin, &role);
-        
+
         for _ in 0..10 {
             let invitee = Address::generate(&env);
             client.create_invitation(&super_admin, &role, &invitee, &3600);
         }
-        
+
         let invitee = Address::generate(&env);
         let result = client.try_create_invitation(&super_admin, &role, &invitee, &3600);
-        assert!(matches!(result, Err(Ok(AccessControlError::RateLimitExceeded))));
+        assert!(matches!(
+            result,
+            Err(Ok(AccessControlError::RateLimitExceeded))
+        ));
     }
 
     #[test]
@@ -1149,14 +1380,17 @@ mod tests {
         let client = client_for(&env, &contract_id);
         let role = Symbol::new(&env, "manager");
         let invitee = Address::generate(&env);
-        
+
         client.create_role(&super_admin, &role);
         client.create_invitation(&super_admin, &role, &invitee, &3600);
-        
+
         client.revoke_invitation(&super_admin, &role, &invitee);
-        
+
         let result = client.try_accept_invitation(&invitee, &role);
-        assert!(matches!(result, Err(Ok(AccessControlError::InvitationNotFound))));
+        assert!(matches!(
+            result,
+            Err(Ok(AccessControlError::InvitationNotFound))
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1640,5 +1874,185 @@ mod tests {
         let events = env.events().all();
         let last = events.last().unwrap();
         assert_eq!(last.1, (EV_ADMIN_REMOVED,).into_val(&env));
+    }
+
+    // -----------------------------------------------------------------------
+    // Ownership transfer contract tests (Issue #150)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ownership_transfer_lifecycle() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let new_owner = Address::generate(&env);
+        env.ledger().set_timestamp(100);
+
+        // Initially: super_admin holds ownership
+        assert_eq!(client.super_admin(), super_admin);
+        assert!(client.is_admin(&super_admin));
+        assert!(client.has_role(&symbol_short!("super"), &super_admin));
+        assert!(!client.is_admin(&new_owner));
+        assert_eq!(client.get_pending_ownership(), None);
+
+        // 1. Propose transfer
+        client.transfer_ownership(&super_admin, &new_owner, &200);
+
+        let pending = client.get_pending_ownership().unwrap();
+        assert_eq!(pending.current_owner, super_admin);
+        assert_eq!(pending.target_owner, new_owner);
+        assert_eq!(pending.expiry, 200);
+
+        // Crucial acceptance criterion: ownership does not change until accepted
+        assert_eq!(client.super_admin(), super_admin);
+        assert!(client.has_role(&symbol_short!("super"), &super_admin));
+        assert!(!client.has_role(&symbol_short!("super"), &new_owner));
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(last.1, (EV_OWNERSHIP_TRANSFER_PROPOSED,).into_val(&env));
+
+        // 2. Accept transfer by target owner
+        env.ledger().set_timestamp(150);
+        client.accept_ownership(&new_owner);
+
+        // State after acceptance
+        assert_eq!(client.super_admin(), new_owner);
+        assert!(client.is_admin(&new_owner));
+        assert!(client.has_role(&symbol_short!("super"), &new_owner));
+        assert!(!client.has_role(&symbol_short!("super"), &super_admin));
+        assert_eq!(client.get_pending_ownership(), None);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(last.1, (EV_OWNERSHIP_TRANSFER_ACCEPTED,).into_val(&env));
+    }
+
+    #[test]
+    fn ownership_transfer_cancel() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let new_owner = Address::generate(&env);
+        env.ledger().set_timestamp(100);
+
+        client.transfer_ownership(&super_admin, &new_owner, &200);
+        assert!(client.get_pending_ownership().is_some());
+
+        // Cancel by super_admin
+        client.cancel_ownership_transfer(&super_admin);
+        assert_eq!(client.get_pending_ownership(), None);
+        assert_eq!(client.super_admin(), super_admin);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(last.1, (EV_OWNERSHIP_TRANSFER_CANCELLED,).into_val(&env));
+
+        // Target cannot accept after cancellation
+        assert_eq!(
+            client.try_accept_ownership(&new_owner),
+            Err(Ok(AccessControlError::NoPendingTransfer))
+        );
+    }
+
+    #[test]
+    fn ownership_transfer_expiry_rejected() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let new_owner = Address::generate(&env);
+        env.ledger().set_timestamp(100);
+
+        client.transfer_ownership(&super_admin, &new_owner, &200);
+
+        // Advance ledger past expiry
+        env.ledger().set_timestamp(201);
+
+        assert_eq!(
+            client.try_accept_ownership(&new_owner),
+            Err(Ok(AccessControlError::TransferExpired))
+        );
+
+        // Ownership remains unchanged
+        assert_eq!(client.super_admin(), super_admin);
+        assert_eq!(client.get_pending_ownership(), None);
+    }
+
+    #[test]
+    fn ownership_transfer_unauthorized_accept_rejected() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let new_owner = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        env.ledger().set_timestamp(100);
+
+        client.transfer_ownership(&super_admin, &new_owner, &200);
+
+        assert_eq!(
+            client.try_accept_ownership(&stranger),
+            Err(Ok(AccessControlError::NotPendingOwner))
+        );
+
+        assert_eq!(client.super_admin(), super_admin);
+    }
+
+    #[test]
+    fn ownership_transfer_unauthorized_propose_and_cancel_rejected() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let new_owner = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        env.ledger().set_timestamp(100);
+
+        // Stranger cannot propose
+        assert_eq!(
+            client.try_transfer_ownership(&stranger, &new_owner, &200),
+            Err(Ok(AccessControlError::NotAdmin))
+        );
+
+        client.transfer_ownership(&super_admin, &new_owner, &200);
+
+        // Stranger cannot cancel
+        assert_eq!(
+            client.try_cancel_ownership_transfer(&stranger),
+            Err(Ok(AccessControlError::NotAdmin))
+        );
+    }
+
+    #[test]
+    fn ownership_transfer_duplicate_proposal_rejected() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let owner1 = Address::generate(&env);
+        let owner2 = Address::generate(&env);
+        env.ledger().set_timestamp(100);
+
+        client.transfer_ownership(&super_admin, &owner1, &200);
+
+        assert_eq!(
+            client.try_transfer_ownership(&super_admin, &owner2, &250),
+            Err(Ok(AccessControlError::TransferAlreadyPending))
+        );
+    }
+
+    #[test]
+    fn ownership_transfer_invalid_arguments_rejected() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let target = Address::generate(&env);
+        env.ledger().set_timestamp(100);
+
+        // Expiry in past or equal to current timestamp
+        assert_eq!(
+            client.try_transfer_ownership(&super_admin, &target, &100),
+            Err(Ok(AccessControlError::InvalidExpiry))
+        );
+        assert_eq!(
+            client.try_transfer_ownership(&super_admin, &target, &99),
+            Err(Ok(AccessControlError::InvalidExpiry))
+        );
+
+        // Self transfer
+        assert_eq!(
+            client.try_transfer_ownership(&super_admin, &super_admin, &200),
+            Err(Ok(AccessControlError::SelfReference))
+        );
     }
 }

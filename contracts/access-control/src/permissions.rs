@@ -34,6 +34,10 @@ pub enum Action {
     ReadAuditTrail,
     /// Pause a scoped family of operations via the emergency circuit breaker.
     PauseScope(Symbol),
+    /// Transfer contract ownership with pending acceptance and expiry.
+    TransferOwnership,
+    /// Cancel a pending ownership transfer.
+    CancelOwnershipTransfer,
 }
 
 /// How widely an action's authority extends.
@@ -97,6 +101,16 @@ pub fn policy_for(action: &Action) -> ActionPolicy {
         },
         Action::PauseScope(_) => ActionPolicy {
             permission: Permission::ManageConfiguration,
+            role: Role::Admin,
+            scope: ActionScope::Global,
+        },
+        Action::TransferOwnership => ActionPolicy {
+            permission: Permission::ManageRoles,
+            role: Role::Admin,
+            scope: ActionScope::Global,
+        },
+        Action::CancelOwnershipTransfer => ActionPolicy {
+            permission: Permission::ManageRoles,
             role: Role::Admin,
             scope: ActionScope::Global,
         },
@@ -183,7 +197,7 @@ mod tests {
         let role = symbol_short!("manager");
         let inviter = Address::generate(&env);
 
-        let matrix: [(Action, Permission, ActionScope); 6] = [
+        let matrix: [(Action, Permission, ActionScope); 9] = [
             (
                 Action::ManageMaintainers,
                 Permission::ManageRoles,
@@ -219,6 +233,16 @@ mod tests {
                 Permission::ManageConfiguration,
                 ActionScope::Global,
             ),
+            (
+                Action::TransferOwnership,
+                Permission::ManageRoles,
+                ActionScope::Global,
+            ),
+            (
+                Action::CancelOwnershipTransfer,
+                Permission::ManageRoles,
+                ActionScope::Global,
+            ),
         ];
 
         for (action, permission, scope) in matrix {
@@ -243,6 +267,8 @@ mod tests {
             Action::AssignRoles,
             Action::ReadAuditTrail,
             Action::PauseScope(symbol_short!("ops")),
+            Action::TransferOwnership,
+            Action::CancelOwnershipTransfer,
         ];
         for action in global {
             assert_eq!(policy_for(&action).scope, ActionScope::Global);
