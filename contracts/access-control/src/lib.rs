@@ -74,6 +74,8 @@ pub enum AccessControlError {
     TransferAlreadyPending = 221,
     /// Invalid expiry timestamp.
     InvalidExpiry = 222,
+    /// The requested role-grant duration is zero or otherwise invalid.
+    InvalidDuration = 223,
 }
 
 type ContractResult<T> = core::result::Result<T, AccessControlError>;
@@ -118,7 +120,7 @@ enum DataKey {
     RoleParent(Symbol),
     /// Whether a role name has been registered: `role -> bool`.
     RoleExists(Symbol),
-    /// Membership entry: `(role, member) -> bool`.
+    /// Membership entry: `(role, member) -> RoleGrant`.
     RoleMember(Symbol, Address),
     /// Direct members ever seen for a role, used for off-chain enumeration.
     RoleMemberList(Symbol),
@@ -144,6 +146,46 @@ pub struct Invitation {
     pub inviter: Address,
     pub role: Symbol,
     pub expires_at: u64,
+}
+
+/// A role membership entry.  `active` is the soft-delete flag `revoke_role`
+/// already used; `expires_at` optionally bounds the grant in time so that
+/// [`AccessControlContract::has_role`] treats it as inactive once the ledger
+/// timestamp passes it, without requiring a separate revocation transaction.
+/// `expires_at: None` is a permanent grant, unaffected by expiration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleGrant {
+    pub active: bool,
+    pub expires_at: Option<u64>,
+}
+
+impl RoleGrant {
+    fn permanent() -> Self {
+        Self {
+            active: true,
+            expires_at: None,
+        }
+    }
+
+    fn timed(expires_at: u64) -> Self {
+        Self {
+            active: true,
+            expires_at: Some(expires_at),
+        }
+    }
+
+    fn revoked() -> Self {
+        Self {
+            active: false,
+            expires_at: None,
+        }
+    }
+
+    /// `true` when the grant is active and, if time-bounded, not yet expired.
+    fn is_in_effect(&self, now: u64) -> bool {
+        self.active && self.expires_at.map_or(true, |expires_at| now <= expires_at)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -841,9 +883,69 @@ impl AccessControlContract {
     }
 
     /// Returns `true` if `user` holds `role`, either directly or via an
-    /// ancestor in the hierarchy.
+    /// ancestor in the hierarchy. A time-bounded direct grant is treated as
+    /// inactive once the ledger timestamp passes its expiration — no
+    /// separate revocation call is required.
     pub fn has_role(env: Env, role: Symbol, user: Address) -> bool {
         has_role_recursive(&env, &role, &user)
+    }
+
+    /// Grant `role` to `user` for `duration_seconds`, measured from the
+    /// current ledger timestamp.  Admin-gated, same authorization as
+    /// [`Self::grant_role`].
+    ///
+    /// Once the ledger timestamp passes the computed expiration,
+    /// [`Self::has_role`] automatically returns `false` for this grant with
+    /// no further transaction required. Permanent grants remain available
+    /// via [`Self::grant_role`], which stores `expires_at: None`.
+    pub fn grant_role_timed(
+        env: Env,
+        caller: Address,
+        role: Symbol,
+        account: Address,
+        duration_seconds: u64,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller, &Action::AssignRoles)?;
+
+        ensure_role_exists(&env, &role)?;
+
+        if duration_seconds == 0 {
+            return Err(AccessControlError::InvalidDuration);
+        }
+
+        let expires_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(duration_seconds)
+            .ok_or(AccessControlError::InvalidDuration)?;
+
+        let was_member = has_direct_role(&env, &role, &account);
+        grant_role_timed_internal(&env, &role, &account, expires_at);
+        record_access_audit(
+            &env,
+            &caller,
+            TimelineEventType::RoleChanged,
+            symbol_short!("role_grt"),
+            symbol_short!("timed"),
+            Some(account.clone()),
+            Some(role.clone()),
+            Some(if was_member { 1 } else { 0 }),
+            Some(1),
+        )?;
+
+        env.events()
+            .publish((EV_ROLE_GRANTED,), (role, account, caller, expires_at));
+        Ok(())
+    }
+
+    /// Returns the expiration ledger timestamp for `user`'s direct grant of
+    /// `role`, if any grant record exists. `None` when no grant has ever
+    /// been recorded, or when the recorded grant is permanent
+    /// (`expires_at: None`). The returned timestamp may already be in the
+    /// past — callers wanting to know current membership should use
+    /// [`Self::has_role`] instead, which already accounts for expiration.
+    pub fn get_role_expiration(env: Env, role: Symbol, account: Address) -> Option<u64> {
+        role_grant(&env, &role, &account).and_then(|grant| grant.expires_at)
     }
 
     // -----------------------------------------------------------------------
@@ -1106,11 +1208,25 @@ fn ensure_role_exists(env: &Env, role: &Symbol) -> ContractResult<()> {
     }
 }
 
-/// Grant `role` to `user` — writes the membership entry.
+/// Grant `role` to `user` permanently — writes the membership entry with no
+/// expiration.
 fn grant_role_internal(env: &Env, role: &Symbol, user: &Address) {
+    write_role_grant(env, role, user, RoleGrant::permanent());
+}
+
+/// Grant `role` to `user` until `expires_at` (a ledger timestamp in seconds).
+/// [`has_role`] automatically treats the grant as inactive once the ledger
+/// timestamp passes `expires_at`, without a separate revocation call.
+fn grant_role_timed_internal(env: &Env, role: &Symbol, user: &Address, expires_at: u64) {
+    write_role_grant(env, role, user, RoleGrant::timed(expires_at));
+}
+
+/// Writes `grant` for `(role, user)` and tracks `user` in the role's member
+/// list for off-chain enumeration.
+fn write_role_grant(env: &Env, role: &Symbol, user: &Address, grant: RoleGrant) {
     env.storage()
         .instance()
-        .set(&DataKey::RoleMember(role.clone(), user.clone()), &true);
+        .set(&DataKey::RoleMember(role.clone(), user.clone()), &grant);
 
     let mut members: Vec<Address> = env
         .storage()
@@ -1132,11 +1248,11 @@ fn has_direct_role(env: &Env, role: &Symbol, user: &Address) -> bool {
     role_member(env, role, user)
 }
 
-/// Revoke `role` from `user` — sets membership to false (soft-delete).
+/// Revoke `role` from `user` — sets membership to inactive (soft-delete).
 fn revoke_role_internal(env: &Env, role: &Symbol, user: &Address) {
     env.storage()
         .instance()
-        .set(&DataKey::RoleMember(role.clone(), user.clone()), &false);
+        .set(&DataKey::RoleMember(role.clone(), user.clone()), &RoleGrant::revoked());
 }
 
 /// Recursively check if `user` holds `role` (directly or via ancestors).
@@ -1158,11 +1274,23 @@ pub(crate) fn has_role_recursive(env: &Env, role: &Symbol, user: &Address) -> bo
     false
 }
 
+/// Returns `true` when `user` holds `role` right now — active, and, if
+/// time-bounded, not yet past its `expires_at` ledger timestamp.
 fn role_member(env: &Env, role: &Symbol, user: &Address) -> bool {
+    let now = env.ledger().timestamp();
     env.storage()
         .instance()
-        .get::<DataKey, bool>(&DataKey::RoleMember(role.clone(), user.clone()))
+        .get::<DataKey, RoleGrant>(&DataKey::RoleMember(role.clone(), user.clone()))
+        .map(|grant| grant.is_in_effect(now))
         .unwrap_or(false)
+}
+
+/// Returns the stored role-grant record for `(role, user)`, if one exists —
+/// regardless of whether it is currently active or expired.
+fn role_grant(env: &Env, role: &Symbol, user: &Address) -> Option<RoleGrant> {
+    env.storage()
+        .instance()
+        .get::<DataKey, RoleGrant>(&DataKey::RoleMember(role.clone(), user.clone()))
 }
 
 /// Returns `true` when `ancestor_candidate` is an ancestor of `role` (i.e.
@@ -1612,6 +1740,129 @@ mod tests {
         // Grant employee to user — should NOT satisfy manager check.
         client.grant_role(&super_admin, &employee, &user);
         assert!(!client.has_role(&manager, &user));
+    }
+
+    // -----------------------------------------------------------------------
+    // Time-bounded role grants (#190)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn timed_grant_is_active_before_expiration() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let role = Symbol::new(&env, "auditor");
+        let user = Address::generate(&env);
+
+        client.create_role(&super_admin, &role);
+        client.grant_role_timed(&super_admin, &role, &user, &3600);
+
+        assert!(client.has_role(&role, &user));
+        assert_eq!(
+            client.get_role_expiration(&role, &user),
+            Some(env.ledger().timestamp() + 3600)
+        );
+    }
+
+    #[test]
+    fn timed_grant_expires_automatically_without_manual_revocation() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let role = Symbol::new(&env, "auditor");
+        let user = Address::generate(&env);
+
+        client.create_role(&super_admin, &role);
+        client.grant_role_timed(&super_admin, &role, &user, &3600);
+        assert!(client.has_role(&role, &user));
+
+        // Advance the ledger timestamp exactly to expiration — still in effect.
+        env.ledger().with_mut(|li| li.timestamp += 3600);
+        assert!(client.has_role(&role, &user));
+
+        // One second past expiration — now inactive, with no revoke_role call.
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        assert!(!client.has_role(&role, &user));
+    }
+
+    #[test]
+    fn timed_grant_expiration_also_clears_hierarchy_scoped_permission_checks() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let role = Symbol::new(&env, "manager");
+        let holder = Address::generate(&env);
+        let invitee = Address::generate(&env);
+
+        client.create_role(&super_admin, &role);
+        client.grant_role_timed(&super_admin, &role, &holder, &100);
+
+        // While active, the time-bounded holder can still exercise
+        // role-scoped authority (e.g. inviting into their own role).
+        client.create_invitation(&holder, &role, &invitee, &3600);
+        client.revoke_invitation(&holder, &role, &invitee);
+
+        env.ledger().with_mut(|li| li.timestamp += 101);
+
+        // Past expiration, the same address no longer holds the role and is
+        // denied with the same RoleEscalation error as any outsider.
+        let result = client.try_create_invitation(&holder, &role, &invitee, &3600);
+        assert!(matches!(
+            result,
+            Err(Ok(AccessControlError::RoleEscalation))
+        ));
+    }
+
+    #[test]
+    fn permanent_grant_is_unaffected_by_expiration_logic() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let role = Symbol::new(&env, "auditor");
+        let user = Address::generate(&env);
+
+        client.create_role(&super_admin, &role);
+        client.grant_role(&super_admin, &role, &user);
+
+        assert_eq!(client.get_role_expiration(&role, &user), None);
+
+        env.ledger().with_mut(|li| li.timestamp += 10_000_000);
+        assert!(client.has_role(&role, &user));
+    }
+
+    #[test]
+    fn zero_duration_timed_grant_is_rejected() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let role = Symbol::new(&env, "auditor");
+        let user = Address::generate(&env);
+
+        client.create_role(&super_admin, &role);
+        let result = client.try_grant_role_timed(&super_admin, &role, &user, &0);
+        assert!(matches!(
+            result,
+            Err(Ok(AccessControlError::InvalidDuration))
+        ));
+    }
+
+    #[test]
+    fn non_admin_cannot_grant_timed_role() {
+        let (env, _super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let role = Symbol::new(&env, "auditor");
+        let outsider = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        client.create_role(&_super_admin, &role);
+        let result = client.try_grant_role_timed(&outsider, &role, &user, &3600);
+        assert!(matches!(result, Err(Ok(AccessControlError::NotAdmin))));
+    }
+
+    #[test]
+    fn get_role_expiration_is_none_for_unknown_grant() {
+        let (env, _super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let role = Symbol::new(&env, "auditor");
+        let user = Address::generate(&env);
+
+        client.create_role(&_super_admin, &role);
+        assert_eq!(client.get_role_expiration(&role, &user), None);
     }
 
     #[test]
