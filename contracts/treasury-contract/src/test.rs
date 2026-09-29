@@ -1,3 +1,4 @@
+use crate::storage::TreasuryManager;
 use crate::{TreasuryContract, TreasuryContractClient};
 use shared::errors::Error;
 use soroban_sdk::{

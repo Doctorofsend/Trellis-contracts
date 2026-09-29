@@ -38,6 +38,7 @@ fn snapshot_of(env: &Env, result: &RebalanceResult) -> StateSnapshot {
 #[test]
 fn test_rebalance_dry_run() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, MultiAssetRebalancer);
     let client = MultiAssetRebalancerClient::new(&env, &contract_id);
 
@@ -96,6 +97,7 @@ fn test_rebalance_dry_run() {
 #[test]
 fn test_rebalance_accumulates_slippage_from_multiple_trades() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, MultiAssetRebalancer);
     let client = MultiAssetRebalancerClient::new(&env, &contract_id);
 
@@ -142,6 +144,7 @@ fn test_rebalance_accumulates_slippage_from_multiple_trades() {
 #[test]
 fn test_rebalance_zero_trade_slippage() {
     let env = Env::default();
+    env.mock_all_auths();
     let contract_id = env.register_contract(None, MultiAssetRebalancer);
     let client = MultiAssetRebalancerClient::new(&env, &contract_id);
 

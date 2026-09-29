@@ -207,6 +207,10 @@ impl AccessControlContract {
     }
 
     /// Add a new admin.  Only existing admins may call this.
+    ///
+    /// # Authorization
+    /// Requires the `ManageMaintainers` action permission.  Unauthorized
+    /// callers receive [`AccessControlError::NotAdmin`].
     pub fn add_admin(
         env: Env,
         caller: Address,
@@ -267,6 +271,12 @@ impl AccessControlContract {
 
     /// Remove an admin.  Only existing admins may call this.  The super-admin
     /// cannot be removed.
+    ///
+    /// # Authorization
+    /// Requires the `ManageMaintainers` action permission.  Unauthorized
+    /// callers receive [`AccessControlError::NotAdmin`].  The super-admin
+    /// address cannot be removed and yields
+    /// [`AccessControlError::CannotRemoveSuperAdmin`].
     pub fn remove_admin(
         env: Env,
         caller: Address,
@@ -322,6 +332,10 @@ impl AccessControlContract {
     // -----------------------------------------------------------------------
 
     /// Create a new role.  Admin-gated.
+    ///
+    /// # Authorization
+    /// Requires the `ConfigureRoleRegistry` action permission.  Unauthorized
+    /// callers receive [`AccessControlError::NotAdmin`].
     pub fn create_role(env: Env, caller: Address, role: Symbol) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::ConfigureRoleRegistry)?;
 

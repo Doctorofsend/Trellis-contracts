@@ -94,6 +94,25 @@ fn test_register_submitter_success() {
 
 
 #[test]
+fn test_register_submitter_unauthorized_fails() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    let unauthorized = Address::generate(&fx.env);
+    let result = client.try_register_submitter(&unauthorized, &fx.submitter1);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_register_submitter_revoked_admin_fails() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.deactivate_submitter(&fx.admin, &fx.admin);
+    let result = client.try_register_submitter(&fx.admin, &fx.submitter1);
+    assert!(result.is_err());
+}
+
+
+#[test]
 fn test_register_duplicate_submitter_fails() {
     let fx = setup();
     let client = OracleContractClient::new(&fx.env, &fx.contract_id);
@@ -121,6 +140,27 @@ fn test_deactivate_submitter_success() {
     assert!(client.is_submitter_active(&fx.submitter1));
     client.deactivate_submitter(&fx.admin, &fx.submitter1);
     assert!(!client.is_submitter_active(&fx.submitter1));
+}
+
+
+#[test]
+fn test_deactivate_submitter_unauthorized_fails() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.register_submitter(&fx.admin, &fx.submitter1);
+    let unauthorized = Address::generate(&fx.env);
+    let result = client.try_deactivate_submitter(&unauthorized, &fx.submitter1);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_deactivate_submitter_revoked_admin_fails() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.register_submitter(&fx.admin, &fx.submitter1);
+    client.deactivate_submitter(&fx.admin, &fx.admin);
+    let result = client.try_deactivate_submitter(&fx.admin, &fx.submitter1);
+    assert!(result.is_err());
 }
 
 
@@ -391,6 +431,25 @@ fn test_stale_submission_rejected() {
 
 
 #[test]
+fn test_set_staleness_window_unauthorized_fails() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    let unauthorized = Address::generate(&fx.env);
+    let result = client.try_set_staleness_window(&unauthorized, &1000);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_set_staleness_window_revoked_admin_fails() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.deactivate_submitter(&fx.admin, &fx.admin);
+    let result = client.try_set_staleness_window(&fx.admin, &1000);
+    assert!(result.is_err());
+}
+
+
+#[test]
 fn test_fresh_submission_within_window() {
     let fx = setup();
     let client = OracleContractClient::new(&fx.env, &fx.contract_id);
@@ -455,6 +514,16 @@ fn test_get_latest_price_after_submit() {
     assert_eq!(latest.decimals, 8);
     assert_eq!(latest.timestamp, ts);
     assert_eq!(latest.submission_count, 1);
+}
+
+
+#[test]
+fn test_get_latest_price_unauthorized_fails() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    let unauthorized = Address::generate(&fx.env);
+    let result = client.try_get_latest_price(&symbol_short!("BTCUSD"));
+    assert!(result.is_err());
 }
 
 

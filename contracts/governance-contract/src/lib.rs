@@ -1351,4 +1351,361 @@ mod tests {
             Err(Ok(Error::InvalidArgument))
         ));
     }
+
+    // -----------------------------------------------------------------------
+    // Authorization matrix
+    //
+    // Every privileged entrypoint below is exercised with an authorized
+    // actor (allow) and an unauthorized actor (deny). Revoked and expired
+    // actors are covered explicitly where the contract supports them.
+    //
+    // Privileged entrypoints and their required roles:
+    //   * initialize      — one-shot bootstrap (no prior role required)
+    //   * grant_role      — Admin (ManageRoles)
+    //   * revoke_role     — Admin (ManageRoles)
+    //   * set_admin_set   — Admin (ManageRoles)
+    //   * propose         — Admin (ManageRoles)
+    //   * approve         — Admin (ManageRoles)
+    //   * execute         — Admin (ManageRoles)
+    //   * cancel          — proposer or super-admin
+    //   * set_param       — Admin (ManageConfiguration)
+    // -----------------------------------------------------------------------
+
+    /// Builds a governance instance with a single admin and a stranger.
+    fn setup_with_stranger() -> (Env, GovernanceContractClient<'static>, Address, Address) {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+        (env, client, admin, stranger)
+    }
+
+    // --- initialize ---------------------------------------------------------
+
+    #[test]
+    fn initialize_allows_first_caller_and_denies_double_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, GovernanceContract);
+        let client = GovernanceContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let mut admin_set: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+        admin_set.push_back(admin.clone());
+
+        // allow: first initialization succeeds
+        client.initialize(&admin, &1, &admin_set);
+        assert!(client.has_role(&admin, &Role::Admin));
+
+        // deny: re-initialization is rejected by the shared auth layer
+        let result = client.try_initialize(&admin, &1, &admin_set);
+        assert!(result.is_err());
+    }
+
+    // --- grant_role ---------------------------------------------------------
+
+    #[test]
+    fn grant_role_allow_admin_deny_stranger() {
+        let (env, client, admin, stranger) = setup_with_stranger();
+        let user = Address::generate(&env);
+
+        // allow
+        client.grant_role(&admin, &user, &Role::Upgrader);
+        assert!(client.has_role(&user, &Role::Upgrader));
+
+        // deny
+        let other = Address::generate(&env);
+        assert_eq!(
+            client.try_grant_role(&stranger, &other, &Role::Upgrader),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert!(!client.has_role(&other, &Role::Upgrader));
+    }
+
+    #[test]
+    fn grant_role_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let admins = client.get_admin_set();
+        let second_admin = admins.get(1).unwrap();
+        let user = Address::generate(&env);
+
+        // Revoke the second admin's Admin role.
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+        assert!(!client.has_role(&second_admin, &Role::Admin));
+
+        // deny: revoked admin can no longer grant roles
+        assert_eq!(
+            client.try_grant_role(&second_admin, &user, &Role::Upgrader),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    // --- revoke_role --------------------------------------------------------
+
+    #[test]
+    fn revoke_role_allow_admin_deny_stranger() {
+        let (env, client, admin, stranger) = setup_with_stranger();
+        let user = Address::generate(&env);
+
+        client.grant_role(&admin, &user, &Role::Pauser);
+
+        // allow
+        client.revoke_role(&admin, &user, &Role::Pauser);
+        assert!(!client.has_role(&user, &Role::Pauser));
+
+        // deny
+        client.grant_role(&admin, &user, &Role::Pauser);
+        assert_eq!(
+            client.try_revoke_role(&stranger, &user, &Role::Pauser),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert!(client.has_role(&user, &Role::Pauser));
+    }
+
+    #[test]
+    fn revoke_role_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let user = Address::generate(&env);
+
+        client.grant_role(&admin, &user, &Role::Pauser);
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_revoke_role(&second_admin, &user, &Role::Pauser),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert!(client.has_role(&user, &Role::Pauser));
+    }
+
+    // --- set_admin_set ------------------------------------------------------
+
+    #[test]
+    fn set_admin_set_allow_admin_deny_stranger() {
+        let (env, client, admin, stranger) = setup_with_stranger();
+        let new_admins = make_admin_set(&env, 2);
+
+        // allow
+        client.set_admin_set(&admin, &new_admins, &1);
+        assert_eq!(client.get_threshold(), 1);
+        assert_eq!(client.get_admin_set().len(), 2);
+
+        // deny
+        let other = make_admin_set(&env, 1);
+        assert_eq!(
+            client.try_set_admin_set(&stranger, &other, &1),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn set_admin_set_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let new_admins = make_admin_set(&env, 1);
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_set_admin_set(&second_admin, &new_admins, &1),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    // --- propose ------------------------------------------------------------
+
+    #[test]
+    fn propose_allow_admin_deny_stranger() {
+        let (_env, client, admin, stranger) = setup_with_stranger();
+
+        // allow
+        let id = client.propose(&admin, &ProposalAction::Pause);
+        assert_eq!(client.get_proposal(&id).status, ProposalStatus::Pending);
+
+        // deny
+        assert_eq!(
+            client.try_propose(&stranger, &ProposalAction::Pause),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn propose_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_propose(&second_admin, &ProposalAction::Pause),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    // --- approve ------------------------------------------------------------
+
+    #[test]
+    fn approve_allow_admin_deny_stranger() {
+        let (env, client, admin, stranger) = setup_with_stranger();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+
+        // allow
+        client.approve(&admin, &id);
+        assert_eq!(client.get_proposal(&id).approval_count, 1);
+
+        // deny
+        assert_eq!(
+            client.try_approve(&stranger, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn approve_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_approve(&second_admin, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn approve_denies_expired_proposal() {
+        let (env, client, admin) = setup();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+        env.ledger().set_timestamp(PROPOSAL_LIFETIME + 1);
+
+        assert_eq!(
+            client.try_approve(&admin, &id),
+            Err(Ok(Error::ProposalExpired))
+        );
+    }
+
+    // --- execute ------------------------------------------------------------
+
+    #[test]
+    fn execute_allow_admin_deny_stranger() {
+        let (env, client, admin, stranger) = setup_with_stranger();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+        client.approve(&admin, &id);
+        client.approve(&second_admin, &id);
+
+        // deny
+        assert_eq!(
+            client.try_execute(&stranger, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+
+        // allow
+        client.execute(&admin, &id);
+        assert_eq!(
+            client.get_proposal(&id).status,
+            ProposalStatus::Executed
+        );
+    }
+
+    #[test]
+    fn execute_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+        client.approve(&admin, &id);
+        client.approve(&second_admin, &id);
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_execute(&second_admin, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn execute_denies_expired_proposal() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+        client.approve(&admin, &id);
+        client.approve(&second_admin, &id);
+        env.ledger().set_timestamp(PROPOSAL_LIFETIME + 1);
+
+        assert_eq!(
+            client.try_execute(&admin, &id),
+            Err(Ok(Error::ProposalExpired))
+        );
+    }
+
+    // --- cancel -------------------------------------------------------------
+
+    #[test]
+    fn cancel_allow_proposer_deny_stranger() {
+        let (_env, client, admin, stranger) = setup_with_stranger();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+
+        // deny
+        assert_eq!(
+            client.try_cancel(&stranger, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+
+        // allow
+        client.cancel(&admin, &id);
+        assert_eq!(
+            client.get_proposal(&id).status,
+            ProposalStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancel_denies_revoked_proposer() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let id = client.propose(&second_admin, &ProposalAction::Pause);
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_cancel(&second_admin, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    // --- set_param ----------------------------------------------------------
+
+    #[test]
+    fn set_param_allow_admin_deny_stranger() {
+        let (_env, client, admin, stranger) = setup_with_stranger();
+
+        // allow
+        client.set_param(&admin, &ParameterKey::AidDefaultExpiry, &120);
+        assert_eq!(client.aid_default_expiry(), 120);
+
+        // deny
+        assert_eq!(
+            client.try_set_param(&stranger, &ParameterKey::AidDefaultExpiry, &240),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(client.aid_default_expiry(), 120);
+    }
+
+    #[test]
+    fn set_param_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_set_param(
+                &second_admin,
+                &ParameterKey::AidDefaultExpiry,
+                &120
+            ),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(client.aid_default_expiry(), DEFAULT_AID_DEFAULT_EXPIRY);
+    }
 }
