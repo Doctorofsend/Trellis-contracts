@@ -28,7 +28,7 @@
 
 use soroban_sdk::{contracterror, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
-use crate::auth::{has_permission, require_permission, Permission, Role};
+use crate::auth::{has_permission, has_role, require_permission, Permission, Role};
 use crate::errors::Error;
 use crate::storage::{persistent_get, persistent_has, persistent_remove, persistent_set};
 use crate::timeline::{record_action_audit_event, TimelineEventType};
@@ -257,7 +257,7 @@ pub fn create_session(
 
     // Check concurrent session limit
     let impersonator_sessions = get_impersonator_sessions(env, impersonator);
-    if impersonator_sessions.len() >= MAX_CONCURRENT_SESSIONS as usize {
+    if impersonator_sessions.len() >= MAX_CONCURRENT_SESSIONS {
         return Err(ImpersonationError::TooManyActiveSessions);
     }
 
@@ -275,7 +275,7 @@ pub fn create_session(
         created_at: now,
         expires_at,
         allow_dangerous_mutations: params.allow_dangerous_mutations,
-        reason: params.reason,
+        reason: params.reason.clone(),
         state: SessionState::Active,
         action_count: 0,
     };
@@ -286,32 +286,48 @@ pub fn create_session(
     // Index by target user
     let mut target_sessions = get_target_sessions(env, &params.target_user);
     target_sessions.push_back(session_id);
-    persistent_set(env, &ImpersonationKey::ActiveSessions(params.target_user.clone()), &target_sessions);
+    persistent_set(
+        env,
+        &ImpersonationKey::ActiveSessions(params.target_user.clone()),
+        &target_sessions,
+    );
 
     // Index by impersonator
     let mut impersonator_session_list = get_impersonator_sessions(env, impersonator);
     impersonator_session_list.push_back(session_id);
-    persistent_set(env, &ImpersonationKey::ImpersonatorSessions(impersonator.clone()), &impersonator_session_list);
+    persistent_set(
+        env,
+        &ImpersonationKey::ImpersonatorSessions(impersonator.clone()),
+        &impersonator_session_list,
+    );
 
     // Log audit event
-    record_action_audit_event(
+    let _ = record_action_audit_event(
         env,
         impersonator,
         TimelineEventType::ConfigChanged,
-        &resource_link_for_session(env, session_id),
-        symbol_short!("impersonation"),
+        resource_link_for_session(env, session_id),
+        Symbol::new(env, "impersonation"),
         symbol_short!("create"),
-        Some(params.reason),
-        Some(params.target_user),
+        params.reason,
+        Some(params.target_user.clone()),
         Some(symbol_short!("scope")),
         Some(i128::from(params.scope as u8)),
         Some(i128::from(expires_at)),
-    )?;
+    );
 
     // Emit event for visibility
     env.events().publish(
-        (symbol_short!("impersonation"), symbol_short!("session_created")),
-        (session_id, impersonator, params.target_user, expires_at),
+        (
+            Symbol::new(env, "impersonation"),
+            Symbol::new(env, "session_created"),
+        ),
+        (
+            session_id,
+            impersonator.clone(),
+            params.target_user,
+            expires_at,
+        ),
     );
 
     Ok(SessionResult {
@@ -333,7 +349,8 @@ pub fn revoke_session(
     let mut session = get_session(env, session_id).ok_or(ImpersonationError::SessionNotFound)?;
 
     // Authorization: only creator or someone with impersonation permission can revoke
-    if session.impersonator != *caller && !has_permission(env, caller, Permission::ImpersonateUser) {
+    if session.impersonator != *caller && !has_permission(env, caller, Permission::ImpersonateUser)
+    {
         return Err(ImpersonationError::Unauthorized);
     }
 
@@ -349,31 +366,37 @@ pub fn revoke_session(
     remove_from_active_indexes(env, &session);
 
     // Log audit event
-    record_action_audit_event(
+    let _ = record_action_audit_event(
         env,
         caller,
         TimelineEventType::ConfigChanged,
-        &resource_link_for_session(env, session_id),
-        symbol_short!("impersonation"),
+        resource_link_for_session(env, session_id),
+        Symbol::new(env, "impersonation"),
         symbol_short!("revoke"),
-        Some(session.reason),
+        session.reason,
         Some(session.target_user),
         None,
         None,
         None,
-    )?;
+    );
 
     // Emit event
     env.events().publish(
-        (symbol_short!("impersonation"), symbol_short!("session_revoked")),
-        (session_id, caller),
+        (
+            Symbol::new(env, "impersonation"),
+            Symbol::new(env, "session_revoked"),
+        ),
+        (session_id, caller.clone()),
     );
 
     Ok(())
 }
 
 /// Validates and returns an active session if it exists and is not expired.
-pub fn validate_session(env: &Env, session_id: u64) -> Result<ImpersonationSession, ImpersonationError> {
+pub fn validate_session(
+    env: &Env,
+    session_id: u64,
+) -> Result<ImpersonationSession, ImpersonationError> {
     let session = get_session(env, session_id).ok_or(ImpersonationError::SessionNotFound)?;
 
     if session.state != SessionState::Active {
@@ -385,7 +408,11 @@ pub fn validate_session(env: &Env, session_id: u64) -> Result<ImpersonationSessi
         // Auto-expire the session
         let mut expired_session = session;
         expired_session.state = SessionState::Expired;
-        persistent_set(env, &ImpersonationKey::Session(session_id), &expired_session);
+        persistent_set(
+            env,
+            &ImpersonationKey::Session(session_id),
+            &expired_session,
+        );
         remove_from_active_indexes(env, &expired_session);
         return Err(ImpersonationError::SessionExpired);
     }
@@ -449,24 +476,31 @@ pub fn record_action(
     persistent_set(env, &ImpersonationKey::Session(session_id), &session);
 
     // Log audit event
-    record_action_audit_event(
+    let _ = record_action_audit_event(
         env,
         &session.impersonator,
         TimelineEventType::RecordUpdated,
-        &resource_link_for_resource(env, resource_type, resource_id),
-        symbol_short!("impersonation"),
-        symbol_short!("action"),
-        Some(action_type.as_symbol()),
+        resource_link_for_resource(env, resource_type, resource_id),
+        Symbol::new(env, "impersonation"),
+        action_type.as_symbol(),
+        action_type.as_symbol(),
         Some(session.target_user),
         Some(resource_type.as_symbol()),
         resource_id.map(|id| i128::from(id)),
         Some(i128::from(session.action_count)),
-    )?;
+    );
 
     // Emit event
     env.events().publish(
-        (symbol_short!("impersonation"), symbol_short!("action_recorded")),
-        (session_id, action_type.as_symbol(), resource_type.as_symbol()),
+        (
+            Symbol::new(env, "impersonation"),
+            Symbol::new(env, "action_recorded"),
+        ),
+        (
+            session_id,
+            action_type.as_symbol(),
+            resource_type.as_symbol(),
+        ),
     );
 
     Ok(())
@@ -478,7 +512,7 @@ pub fn get_active_sessions_for_user(env: &Env, target_user: &Address) -> Vec<Imp
     let mut active_sessions = Vec::new(env);
 
     for session_id in session_ids.iter() {
-        if let Ok(session) = validate_session(env, *session_id) {
+        if let Ok(session) = validate_session(env, session_id) {
             active_sessions.push_back(session);
         }
     }
@@ -487,12 +521,15 @@ pub fn get_active_sessions_for_user(env: &Env, target_user: &Address) -> Vec<Imp
 }
 
 /// Gets active impersonation sessions for an impersonator.
-pub fn get_active_sessions_for_impersonator(env: &Env, impersonator: &Address) -> Vec<ImpersonationSession> {
+pub fn get_active_sessions_for_impersonator(
+    env: &Env,
+    impersonator: &Address,
+) -> Vec<ImpersonationSession> {
     let session_ids = get_impersonator_sessions(env, impersonator);
     let mut active_sessions = Vec::new(env);
 
     for session_id in session_ids.iter() {
-        if let Ok(session) = validate_session(env, *session_id) {
+        if let Ok(session) = validate_session(env, session_id) {
             active_sessions.push_back(session);
         }
     }
@@ -509,7 +546,7 @@ pub fn is_being_impersonated(env: &Env, target_user: &Address) -> bool {
 /// Gets the current impersonation session for a target user (if any).
 pub fn get_current_impersonation(env: &Env, target_user: &Address) -> Option<ImpersonationSession> {
     let sessions = get_active_sessions_for_user(env, target_user);
-    sessions.first().cloned()
+    sessions.first()
 }
 
 // ---------------------------------------------------------------------------
@@ -540,12 +577,12 @@ impl ImpersonationAction {
     fn as_symbol(&self) -> Symbol {
         match self {
             ImpersonationAction::Read => symbol_short!("read"),
-            ImpersonationAction::Diagnostic => symbol_short!("diagnostic"),
-            ImpersonationAction::SafeMutation => symbol_short!("safe_mutation"),
-            ImpersonationAction::DangerousMutation => symbol_short!("dangerous_mutation"),
-            ImpersonationAction::ConfigChange => symbol_short!("config_change"),
-            ImpersonationAction::RoleManagement => symbol_short!("role_management"),
-            ImpersonationAction::TreasuryOperation => symbol_short!("treasury_op"),
+            ImpersonationAction::Diagnostic => symbol_short!("diagnos"),
+            ImpersonationAction::SafeMutation => symbol_short!("safemut"),
+            ImpersonationAction::DangerousMutation => symbol_short!("dangmut"),
+            ImpersonationAction::ConfigChange => symbol_short!("cfgchg"),
+            ImpersonationAction::RoleManagement => symbol_short!("rolemgmt"),
+            ImpersonationAction::TreasuryOperation => symbol_short!("tres_op"),
         }
     }
 }
@@ -568,13 +605,20 @@ impl ResourceType {
 // Helper Functions
 // ---------------------------------------------------------------------------
 
-fn is_valid_scope(env: &Env, scope: &ImpersonationScope, resource_scopes: &Vec<ResourceScope>) -> bool {
+fn is_valid_scope(
+    env: &Env,
+    scope: &ImpersonationScope,
+    resource_scopes: &Vec<ResourceScope>,
+) -> bool {
     // Basic validation: scope should match resource scopes
     match scope {
         ImpersonationScope::ReadOnly | ImpersonationScope::Diagnostic => {
             // These scopes should not include treasury or roles
             for rs in resource_scopes.iter() {
-                if matches!(rs.resource_type, ResourceType::Treasury | ResourceType::Roles) {
+                if matches!(
+                    rs.resource_type,
+                    ResourceType::Treasury | ResourceType::Roles
+                ) {
                     return false;
                 }
             }
@@ -647,8 +691,11 @@ fn get_target_sessions(env: &Env, target_user: &Address) -> Vec<u64> {
 }
 
 fn get_impersonator_sessions(env: &Env, impersonator: &Address) -> Vec<u64> {
-    persistent_get(env, &ImpersonationKey::ImpersonatorSessions(impersonator.clone()))
-        .unwrap_or_else(|| Vec::new(env))
+    persistent_get(
+        env,
+        &ImpersonationKey::ImpersonatorSessions(impersonator.clone()),
+    )
+    .unwrap_or_else(|| Vec::new(env))
 }
 
 fn next_session_id(env: &Env) -> u64 {
@@ -664,9 +711,16 @@ fn remove_from_active_indexes(env: &Env, session: &ImpersonationSession) {
     if let Some(pos) = target_sessions.first_index_of(session.session_id) {
         let _ = target_sessions.remove(pos);
         if target_sessions.is_empty() {
-            persistent_remove(env, &ImpersonationKey::ActiveSessions(session.target_user.clone()));
+            persistent_remove(
+                env,
+                &ImpersonationKey::ActiveSessions(session.target_user.clone()),
+            );
         } else {
-            persistent_set(env, &ImpersonationKey::ActiveSessions(session.target_user.clone()), &target_sessions);
+            persistent_set(
+                env,
+                &ImpersonationKey::ActiveSessions(session.target_user.clone()),
+                &target_sessions,
+            );
         }
     }
 
@@ -675,9 +729,16 @@ fn remove_from_active_indexes(env: &Env, session: &ImpersonationSession) {
     if let Some(pos) = impersonator_sessions.first_index_of(session.session_id) {
         let _ = impersonator_sessions.remove(pos);
         if impersonator_sessions.is_empty() {
-            persistent_remove(env, &ImpersonationKey::ImpersonatorSessions(session.impersonator.clone()));
+            persistent_remove(
+                env,
+                &ImpersonationKey::ImpersonatorSessions(session.impersonator.clone()),
+            );
         } else {
-            persistent_set(env, &ImpersonationKey::ImpersonatorSessions(session.impersonator.clone()), &impersonator_sessions);
+            persistent_set(
+                env,
+                &ImpersonationKey::ImpersonatorSessions(session.impersonator.clone()),
+                &impersonator_sessions,
+            );
         }
     }
 }
@@ -695,7 +756,7 @@ fn resource_link_for_resource(
     resource_type: ResourceType,
     resource_id: Option<u64>,
 ) -> crate::timeline::ResourceLink {
-    let kind_bytes = match resource_type {
+    let kind_bytes: &[u8] = match resource_type {
         ResourceType::Aid => b"aid",
         ResourceType::Payment => b"payment",
         ResourceType::Escrow => b"escrow",
@@ -729,7 +790,7 @@ mod tests {
         // Setup admin first
         let admin = Address::generate(&env);
         let _ = crate::auth::initialize_admin(&env, &admin);
-        
+
         // Grant Support role to impersonator
         let _ = crate::auth::grant_role(&env, &admin, &support, Role::Support);
 
@@ -900,7 +961,10 @@ mod tests {
             ResourceType::Treasury,
             None,
         );
-        assert_eq!(permission, Err(ImpersonationError::DangerousMutationBlocked));
+        assert_eq!(
+            permission,
+            Err(ImpersonationError::DangerousMutationBlocked)
+        );
     }
 
     #[test]

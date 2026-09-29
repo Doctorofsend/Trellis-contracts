@@ -393,14 +393,14 @@ pub fn validate_scheduled_action(
         WindowStatus::Valid => Ok(window),
         WindowStatus::Early => {
             env.events().publish(
-                (symbol_short!("timeline"), symbol_short!("sched_early")),
+                (symbol_short!("timeline"), Symbol::new(env, "sched_early")),
                 (action_id, now, window.start),
             );
             Err(Error::Unauthorized)
         }
         WindowStatus::Late => {
             env.events().publish(
-                (symbol_short!("timeline"), symbol_short!("sched_late")),
+                (symbol_short!("timeline"), Symbol::new(env, "sched_late")),
                 (action_id, now, window.end),
             );
             Err(Error::Unauthorized)
@@ -408,7 +408,7 @@ pub fn validate_scheduled_action(
         WindowStatus::Stale => {
             let stale = window.stale_after.unwrap_or(window.end);
             env.events().publish(
-                (symbol_short!("timeline"), symbol_short!("sched_stale")),
+                (symbol_short!("timeline"), Symbol::new(env, "sched_stale")),
                 (action_id, now, stale),
             );
             Err(Error::Unauthorized)
@@ -453,7 +453,7 @@ pub fn record_scheduled_execution(
         summary,
     )?;
     env.events().publish(
-        (symbol_short!("timeline"), symbol_short!("sched_exec")),
+        (symbol_short!("timeline"), Symbol::new(env, "sched_exec")),
         (action_id, now, window.start, window.end),
     );
     Ok(())

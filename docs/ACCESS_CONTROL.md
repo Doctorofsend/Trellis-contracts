@@ -42,6 +42,8 @@ uses, so a new privileged action adds a row rather than a new bespoke check.
 | `InviteMember(role)` | `ManageRoles` | Role-scoped to `role` | `create_invitation` |
 | `CancelInvitation(inviter)` | `ManageRoles` | Owner-scoped to `inviter` | `revoke_invitation` |
 | `ReadAuditTrail` | `ReadAuditTrail` | Global | `audit_trail` |
+| `TransferOwnership` | `ManageRoles` | Global | `transfer_ownership` |
+| `CancelOwnershipTransfer` | `ManageRoles` | Global | `cancel_ownership_transfer` |
 
 Scope narrows authority beyond the role:
 

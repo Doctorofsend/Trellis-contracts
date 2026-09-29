@@ -36,6 +36,24 @@ pub enum Error {
     UnknownOperation = 30,
     /// The pause scope is already in the requested state.
     PauseScopeUnchanged = 31,
+    /// The requested operation is currently paused by the circuit breaker.
+    OperationPaused = 32,
+    /// The record is not eligible for deactivation.
+    RecordNotEligibleForDeactivation = 33,
+    /// The record is already active.
+    RecordAlreadyActive = 34,
+    /// The record is already deactivated.
+    RecordAlreadyDeactivated = 35,
+    /// The record is deactivated and cannot perform restricted operations.
+    RecordDeactivated = 36,
+    /// No pending ownership transfer exists.
+    NoPendingTransfer = 37,
+    /// The pending ownership transfer has expired.
+    TransferExpired = 38,
+    /// Caller is not the designated pending owner.
+    NotPendingOwner = 39,
+    /// An ownership transfer is already pending.
+    TransferAlreadyPending = 40,
     /// The proposal was not found.
     ProposalNotFound = 12,
     /// The caller has already approved this proposal.

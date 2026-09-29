@@ -52,5 +52,14 @@
     "migration_notes": "",
     "issue": 144,
     "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-09-29",
+    "impact": "compatible",
+    "summary": "Implemented two-step ownership transfer with pending acceptance and expiry (shared::auth, contracts/access-control), preventing accidental reassignment.",
+    "migration_notes": "",
+    "issue": 150,
+    "pr": null
   }
 ]
