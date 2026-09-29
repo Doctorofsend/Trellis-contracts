@@ -2,6 +2,7 @@ use crate::{TreasuryContract, TreasuryContractClient};
 use shared::errors::Error;
 use soroban_sdk::{
     contract, contractimpl, symbol_short,
+    testutils::Ledger as _,
     testutils::{Address as _, Events},
     Address, Env,
 };
@@ -416,4 +417,176 @@ fn gas_bench_emergency_withdraw_rejects_zero_before_auth() {
 
     let result = client.try_emergency_withdraw(&admin, &token, &recipient, &0);
     assert_eq!(result, Err(Ok(Error::InvalidArgument)));
+}
+
+// ===========================================================================
+// Time-window validation tests
+// ===========================================================================
+
+/// Helper: schedule a withdrawal with an explicit [start, expiry] window.
+fn schedule_withdraw(
+    env: &Env,
+    client: &TreasuryContractClient,
+    admin: &Address,
+    token: &Address,
+    recipient: &Address,
+    amount: i128,
+    category: &soroban_sdk::Symbol,
+    start: u64,
+    expiry: u64,
+) -> Result<(), Error> {
+    let _ = env;
+    match client.try_schedule_withdraw(
+        admin, token, recipient, &amount, category, &start, &expiry,
+    ) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(Error::InvalidArgument),
+        Err(Ok(error)) => Err(error),
+        Err(Err(_)) => Err(Error::InvalidArgument),
+    }
+}
+
+#[test]
+fn test_scheduled_action_rejected_before_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _limit) = setup(&env);
+    let token = Address::generate(&env);
+    let category = symbol_short!("reserve");
+    let recipient = Address::generate(&env);
+
+    client.deposit(&admin, &token, &category, &500);
+
+    // Ledger time is 0; window opens at 100.
+    env.ledger().set_timestamp(0);
+    let result = schedule_withdraw(
+        &env, &client, &admin, &token, &recipient, 100, &category, 100, 200,
+    );
+    assert_eq!(result, Err(Error::ActionNotYetValid));
+    assert_eq!(client.category_balance(&token, &category), 500);
+}
+
+#[test]
+fn test_scheduled_action_valid_inside_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _limit) = setup(&env);
+    let token = Address::generate(&env);
+    let category = symbol_short!("reserve");
+    let recipient = Address::generate(&env);
+
+    client.deposit(&admin, &token, &category, &500);
+
+    env.ledger().set_timestamp(150);
+    let result = schedule_withdraw(
+        &env, &client, &admin, &token, &recipient, 100, &category, 100, 200,
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(client.category_balance(&token, &category), 400);
+}
+
+#[test]
+fn test_scheduled_action_rejected_after_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _limit) = setup(&env);
+    let token = Address::generate(&env);
+    let category = symbol_short!("reserve");
+    let recipient = Address::generate(&env);
+
+    client.deposit(&admin, &token, &category, &500);
+
+    env.ledger().set_timestamp(250);
+    let result = schedule_withdraw(
+        &env, &client, &admin, &token, &recipient, 100, &category, 100, 200,
+    );
+    assert_eq!(result, Err(Error::ActionExpired));
+    assert_eq!(client.category_balance(&token, &category), 500);
+}
+
+#[test]
+fn test_scheduled_action_boundary_start_inclusive() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _limit) = setup(&env);
+    let token = Address::generate(&env);
+    let category = symbol_short!("reserve");
+    let recipient = Address::generate(&env);
+
+    client.deposit(&admin, &token, &category, &500);
+
+    // Exactly at start -> accepted.
+    env.ledger().set_timestamp(100);
+    let result = schedule_withdraw(
+        &env, &client, &admin, &token, &recipient, 100, &category, 100, 200,
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(client.category_balance(&token, &category), 400);
+}
+
+#[test]
+fn test_scheduled_action_boundary_expiry_inclusive() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _limit) = setup(&env);
+    let token = Address::generate(&env);
+    let category = symbol_short!("reserve");
+    let recipient = Address::generate(&env);
+
+    client.deposit(&admin, &token, &category, &500);
+
+    // Exactly at expiry -> accepted (inclusive upper bound).
+    env.ledger().set_timestamp(200);
+    let result = schedule_withdraw(
+        &env, &client, &admin, &token, &recipient, 100, &category, 100, 200,
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(client.category_balance(&token, &category), 400);
+}
+
+#[test]
+fn test_scheduled_action_rejects_manipulated_timestamp_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _limit) = setup(&env);
+    let token = Address::generate(&env);
+    let category = symbol_short!("reserve");
+    let recipient = Address::generate(&env);
+
+    client.deposit(&admin, &token, &category, &500);
+
+    // Expiry <= start is a malformed window and must be rejected up front.
+    env.ledger().set_timestamp(150);
+    let result = schedule_withdraw(
+        &env, &client, &admin, &token, &recipient, 100, &category, 200, 100,
+    );
+    assert_eq!(result, Err(Error::InvalidArgument));
+    assert_eq!(client.category_balance(&token, &category), 500);
+}
+
+#[test]
+fn test_scheduled_action_rejects_stale_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _limit) = setup(&env);
+    let token = Address::generate(&env);
+    let category = symbol_short!("reserve");
+    let recipient = Address::generate(&env);
+
+    client.deposit(&admin, &token, &category, &500);
+
+    // Window is entirely in the past relative to ledger time.
+    env.ledger().set_timestamp(1_000);
+    let result = schedule_withdraw(
+        &env, &client, &admin, &token, &recipient, 100, &category, 100, 200,
+    );
+    assert_eq!(result, Err(Error::ActionExpired));
+    assert_eq!(client.category_balance(&token, &category), 500);
 }

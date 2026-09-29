@@ -81,11 +81,20 @@ this harness rather than duplicating it.
 | A completed request is replayed, not repeated | `shared::idempotency::begin` / `complete` | second `begin` → `Ok(Some(completed record))`; `complete` again → `IdempotencyError::AlreadyCompleted` |
 | A key reused for a different request is rejected | `shared::idempotency::begin` | different `request_hash` → `IdempotencyError::ConflictingRequest` |
 | A signed payload expires on a timestamp, not a sequence | `shared::replay::consume_payload` | `payload.expiry < env.ledger().timestamp()` → replay rejected |
+| A scheduled action before its window is rejected | `shared::schedule::validate_window` | `now < not_before` → `Error::ActionTooEarly` |
+| A scheduled action inside its window executes | `shared::schedule::validate_window` | `not_before <= now <= expires_at` → `Ok(())` |
+| A scheduled action after expiry is rejected | `shared::schedule::validate_window` | `now > expires_at` → `Error::ActionExpired` |
+| A stale scheduled action is rejected before execution | `shared::schedule::execute_action` | `now > expires_at` → `Error::ActionStale`, no state mutation |
+| A window with `not_before > expires_at` is refused | `shared::schedule::validate_window` | inverted window → `Error::InvalidArgument` |
 
 The escrow creation/release asymmetry (creation strict, release inclusive) is
 deliberate: a deposit whose expiry equals the creation ledger would be
 immediately releasable and immediately refundable, so creation requires at
 least one ledger of runway, while release accepts the whole expiry ledger.
+
+Scheduled actions use the same inclusive-boundary convention as release: an
+action is executable on both `not_before` and `expires_at`, so the window is
+closed rather than half-open and an off-by-one regression fails the test.
 
 ## Scenarios and coverage
 
@@ -101,6 +110,11 @@ against the real contract logic:
 | Out of order | `out_of_order_submission_cannot_rewind_the_ledger` | A stamp behind the consumed ledger is `OutOfOrder`; the harness refuses to rewind; a stale deadline is rejected by the contract instead of minting a born-expired escrow. |
 | Repeated submissions | `repeated_submission_does_not_duplicate_release`, `repeated_submission_with_a_different_payload_is_rejected` | Two identical submissions produce one effect and replay the stored result; the same key with a different payload is `ConflictingRequest`, never a replay. |
 | Harness controls | `harness_clock_is_deterministic`, `expiry_window_boundary_is_deterministic` | Sequence ⇒ timestamp, forward-only control, and the future-expiry window at its edges. |
+| Scheduled action early | `scheduled_action_before_window_is_rejected` | `now == not_before - 1` → `Error::ActionTooEarly`; the action record is untouched. |
+| Scheduled action valid | `scheduled_action_inside_window_executes` | `now == not_before` and `now == expires_at` both execute; the effect is applied exactly once. |
+| Scheduled action late | `scheduled_action_after_window_is_rejected` | `now == expires_at + 1` → `Error::ActionExpired`; the action record is untouched. |
+| Scheduled action boundary | `scheduled_action_window_boundaries_are_inclusive` | Both `not_before` and `expires_at` are executable; `not_before - 1` and `expires_at + 1` are refused. |
+| Scheduled action manipulated timestamp | `scheduled_action_rejects_manipulated_timestamp` | A submission stamped behind the consumed ledger is `OutOfOrder`; the harness refuses to rewind; a stale window is rejected instead of executing. |
 
 Which boundary-table rows are pinned by the suite above: escrow creation,
 release and refund; the aid state machine; `validate_future_expiry`; and the
@@ -108,6 +122,10 @@ idempotency guard. The `jobs::run_due_job` / `jobs::enqueue_job` and
 `replay::consume_payload` rows are documented from the code and are the natural
 next additions — the `shared` workers module and `test_replay.rs` currently need
 a contract frame before they can be driven from a test.
+
+The scheduled-action rows are pinned by `shared/src/test_schedule.rs`, which
+drives `shared::schedule` through the harness and covers early, valid, late,
+boundary, and manipulated-timestamp scenarios.
 
 Run just this suite:
 

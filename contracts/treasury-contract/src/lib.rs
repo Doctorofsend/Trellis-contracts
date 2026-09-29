@@ -53,6 +53,77 @@ const REWARDS_CATEGORY: Symbol = symbol_short!("rewards");
 /// Storage key for the referral contract address authorised to call
 /// `distribute_reward`.
 const REFERRAL_CONTRACT: Symbol = symbol_short!("ref_ctr");
+/// Storage key prefix for scheduled-action time windows; full key is
+/// `(SCHEDULE, action_id)`.
+const SCHEDULE: Symbol = symbol_short!("sched");
+
+/// A time window during which a scheduled action may execute.
+///
+/// `not_before` is the earliest ledger timestamp at which the action is valid;
+/// `expires_at` is the exclusive upper bound (the action is stale at or after
+/// this timestamp). Both are unix seconds sourced from `env.ledger().timestamp()`.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeWindow {
+    pub not_before: u64,
+    pub expires_at: u64,
+}
+
+impl TimeWindow {
+    /// Validates `now` against this window, returning a typed error for the
+    /// early / late / stale cases so callers can surface precise diagnostics.
+    pub fn validate(&self, now: u64) -> Result<(), Error> {
+        if self.expires_at <= self.not_before {
+            return Err(Error::InvalidArgument);
+        }
+        if now < self.not_before {
+            return Err(Error::ActionTooEarly);
+        }
+        if now >= self.expires_at {
+            return Err(Error::ActionExpired);
+        }
+        Ok(())
+    }
+}
+
+/// Validates `now` against a window and emits an audit event on failure so
+/// rejected attempts are observable on-chain.
+fn validate_window(
+    env: &Env,
+    actor: &Address,
+    action: Symbol,
+    window: &TimeWindow,
+) -> Result<(), Error> {
+    let now = env.ledger().timestamp();
+    match window.validate(now) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let reason = match err {
+                Error::ActionTooEarly => symbol_short!("early"),
+                Error::ActionExpired => {
+                    if now >= window.expires_at {
+                        symbol_short!("stale")
+                    } else {
+                        symbol_short!("late")
+                    }
+                }
+                _ => symbol_short!("invalid"),
+            };
+            record_treasury_audit(
+                env,
+                actor,
+                TimelineEventType::ActionRejected,
+                action,
+                reason,
+                None,
+                None,
+                Some(window.not_before as i128),
+                Some(window.expires_at as i128),
+            )?;
+            Err(err)
+        }
+    }
+}
 
 fn record_treasury_audit(
     env: &Env,
@@ -327,6 +398,125 @@ impl TreasuryContract {
         );
 
         Ok(())
+    }
+
+    /// Schedules a delayed withdrawal that may only execute inside `window`.
+    ///
+    /// The schedule is stored keyed by `action_id` so it can be executed later
+    /// via [`TreasuryContract::execute_scheduled_withdraw`]. Admin only.
+    pub fn schedule_withdraw(
+        env: Env,
+        caller: Address,
+        action_id: Symbol,
+        token: Address,
+        to: Address,
+        amount: i128,
+        category: Symbol,
+        window: TimeWindow,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+        if amount <= 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // Validate the window shape up-front so we never persist a degenerate
+        // schedule that can never execute.
+        window.validate(window.not_before)?;
+        let key = (SCHEDULE, action_id.clone());
+        if env.storage().instance().has(&key) {
+            return Err(Error::InvalidArgument);
+        }
+        let record = (token.clone(), to.clone(), amount, category.clone(), window.clone());
+        env.storage().instance().set(&key, &record);
+        record_treasury_audit(
+            &env,
+            &caller,
+            TimelineEventType::ConfigChanged,
+            symbol_short!("sched_wd"),
+            symbol_short!("admin_cfg"),
+            Some(token),
+            Some(action_id),
+            Some(window.not_before as i128),
+            Some(window.expires_at as i128),
+        )?;
+        emit_action_executed(
+            &env,
+            symbol_short!("treasury"),
+            symbol_short!("sched_wd"),
+            &caller,
+            true,
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Executes a previously scheduled withdrawal, enforcing its time window.
+    ///
+    /// Rejects with `Error::ActionTooEarly` before `not_before`, and
+    /// `Error::ActionExpired` at or after `expires_at`. The schedule is
+    /// consumed on success so it cannot be replayed.
+    pub fn execute_scheduled_withdraw(
+        env: Env,
+        caller: Address,
+        action_id: Symbol,
+    ) -> Result<(), Error> {
+        let key = (SCHEDULE, action_id.clone());
+        let record: (Address, Address, i128, Symbol, TimeWindow) = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::NotFound)?;
+        let (token, to, amount, category, window) = record;
+
+        // Window check before auth so early/late/stale attempts are cheap and
+        // produce a precise error even for unauthorised callers.
+        validate_window(&env, &caller, symbol_short!("exec_wd"), &window)?;
+
+        auth::require_permission(&env, &caller, Permission::TreasuryOperations)?;
+
+        let limit: i128 = instance_get(&env, &MAX_WD).unwrap_or(0);
+        if amount > limit {
+            return Err(Error::WithdrawalLimitExceeded);
+        }
+        let bal_key = (BALANCE, token.clone(), category.clone());
+        let balance: i128 = instance_get(&env, &bal_key).unwrap_or(0);
+        if amount > balance {
+            return Err(Error::InsufficientBalance);
+        }
+        shared::quota::check_and_consume(&env, &caller, &symbol_short!("wdraw"), amount)?;
+
+        let remaining = balance - amount;
+        instance_set(&env, &bal_key, &remaining);
+        env.storage().instance().remove(&key);
+        record_treasury_audit(
+            &env,
+            &caller,
+            TimelineEventType::PaymentSent,
+            symbol_short!("exec_wd"),
+            symbol_short!("sched_exec"),
+            Some(token.clone()),
+            Some(category.clone()),
+            Some(balance),
+            Some(remaining),
+        )?;
+        emit_treasury_withdrawal(&env, category, &to, &token, amount, remaining);
+        emit_action_executed(
+            &env,
+            symbol_short!("treasury"),
+            symbol_short!("exec_wd"),
+            &caller,
+            true,
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Returns the stored time window for `action_id`, if a schedule exists.
+    pub fn scheduled_window(env: Env, action_id: Symbol) -> Option<TimeWindow> {
+        let key = (SCHEDULE, action_id);
+        env.storage()
+            .instance()
+            .get::<_, (Address, Address, i128, Symbol, TimeWindow)>(&key)
+            .map(|(_, _, _, _, w)| w)
     }
 
     /// Emergency reserve withdrawal for `token`.
