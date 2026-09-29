@@ -1,4 +1,4 @@
-#`!no_std]
+#![no_std]
 
 pub mod abuse;
 pub mod analytics;
@@ -25,6 +25,7 @@ pub mod idempotency;
 pub mod import;
 pub mod jobs;
 pub mod lifecycle;
+pub mod lifecycle_events;
 pub mod math;
 pub mod migration;
 pub mod pagination;
@@ -117,6 +118,12 @@ pub use events::{
 pub use health::{
     get_dependency_health, list_dependency_health, set_dependency_health, DependencyHealth,
     DependencyStatus,
+};
+pub use lifecycle_events::{
+    assert_lifecycle_sequence, emit_aid_event, emit_contract_record_event, emit_escrow_event,
+    emit_lifecycle_transition, emit_proposal_event, emit_resource_transition, LifecycleEvent,
+    LifecycleResource, LifecycleTransition, LIFECYCLE_EVENT_SCHEMA_VERSION, LIFECYCLE_TOPIC,
+    STATE_NONE,
 };
 pub use payments::{
     calculate_fee, calculate_fee_split, create_escrow, deduct_fee, get_escrow, refund_escrow,

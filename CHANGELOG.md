@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `shared::lifecycle_events`: a canonical, versioned event envelope (`("lifecycle", resource, transition)` with schema version, resource ID, from/to state, actor, and timestamp) for every lifecycle transition, plus an ordered-sequence assertion harness (`testing::lifecycle_events`) that fails tests when an expected event is missing or reordered (#144); see `docs/LIFECYCLE_EVENTS.md`
 - `shared::disclosure`: progressive disclosure of transaction detail fields, where a `Critical`-severity field can never end up reachable only through the advanced/expanded view (#125)
 - Machine-readable changelog (`changelog/entries.json` + `changelog/schema.json`) for protocol-facing changes, validated in CI (#126); see `docs/CHANGELOG_SCHEMA.md`
 - Fault-injection test suite (`testing/src/fault_injection.rs`) exercising the sandbox's fake oracle/token/RPC adapters for hard failures, staleness, insufficient balance, and submission timeouts, proving each fails actionably with no partial state (#127)
