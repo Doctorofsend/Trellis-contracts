@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal, Symbol,
+};
 
 use shared::auth::{self, Role};
 use shared::errors::Error;
@@ -33,6 +35,10 @@ const DEFAULT_REFERRAL_MAX_TIERS: i128 = 3;
 const MIN_REFERRAL_REWARD_CAP: i128 = 0;
 const MAX_REFERRAL_REWARD_CAP: i128 = 1_000_000_000_000_000_000;
 const DEFAULT_REFERRAL_REWARD_CAP: i128 = 10_000_000_000;
+/// Maximum signers accepted in a single multi-signature operation.
+pub const MAX_GOVERNANCE_ADMINS: u32 = 20;
+/// Proposals are actionable for 30 days after creation.
+pub const PROPOSAL_LIFETIME: u64 = 30 * 24 * 60 * 60;
 
 type ContractResult<T> = core::result::Result<T, Error>;
 
@@ -93,6 +99,9 @@ pub enum ProposalAction {
     RevokeRole(Address, Role),
     /// Update a protocol parameter: `(key, value)`.
     SetParameter(ParameterKey, i128),
+    /// Execute a parameter update on a target contract:
+    /// `(target, function_name, key, value)`.
+    SetTargetParameter(Address, Symbol, ParameterKey, i128),
     /// Pause the contract.
     Pause,
     /// Unpause the contract.
@@ -105,6 +114,8 @@ pub enum ProposalAction {
 pub enum ProposalStatus {
     Pending,
     Executed,
+    Cancelled,
+    Expired,
 }
 
 /// A multi-sig proposal.
@@ -117,6 +128,7 @@ pub struct Proposal {
     pub approval_count: u32,
     pub status: ProposalStatus,
     pub created_at: u64,
+    pub expires_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,11 +160,11 @@ impl GovernanceContract {
         if threshold < 1 {
             return Err(Error::InvalidArgument);
         }
-        if admin_set.len() < threshold {
+        if admin_set.len() < threshold || admin_set.len() > MAX_GOVERNANCE_ADMINS {
             return Err(Error::InvalidArgument);
         }
 
-        shared::auth::set_admin(&env, &admin);
+        shared::auth::initialize_admin(&env, &admin)?;
         // Grant the Admin role to every address in the admin set so they
         // can propose, approve, and execute.
         let mut i: u32 = 0;
@@ -238,7 +250,10 @@ impl GovernanceContract {
         new_threshold: u32,
     ) -> Result<(), Error> {
         require_admin_role(&env, &caller)?;
-        if new_threshold < 1 || new_admin_set.len() < new_threshold {
+        if new_threshold < 1
+            || new_admin_set.len() < new_threshold
+            || new_admin_set.len() > MAX_GOVERNANCE_ADMINS
+        {
             return Err(Error::InvalidArgument);
         }
         instance_set(&env, &KEY_THRESHOLD, &new_threshold);
@@ -282,6 +297,7 @@ impl GovernanceContract {
             approval_count: 0,
             status: ProposalStatus::Pending,
             created_at: env.ledger().timestamp(),
+            expires_at: env.ledger().timestamp().saturating_add(PROPOSAL_LIFETIME),
         };
 
         let proposal_key = (KEY_PROPOSAL, new_id);
@@ -310,6 +326,16 @@ impl GovernanceContract {
 
         if proposal.status != ProposalStatus::Pending {
             return Err(Error::AlreadyExecuted);
+        }
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            proposal.status = ProposalStatus::Expired;
+            instance_set(&env, &proposal_key, &proposal);
+            env.events().publish(
+                (shared::events::PROPOSAL_EXPIRED,),
+                (proposal_id, env.ledger().timestamp()),
+            );
+            return Err(Error::ProposalExpired);
         }
 
         // Check for duplicate approval.
@@ -354,6 +380,22 @@ impl GovernanceContract {
             return Err(Error::AlreadyExecuted);
         }
 
+        if proposal.status == ProposalStatus::Cancelled
+            || proposal.status == ProposalStatus::Expired
+        {
+            return Err(Error::ProposalCancelled);
+        }
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            proposal.status = ProposalStatus::Expired;
+            instance_set(&env, &proposal_key, &proposal);
+            env.events().publish(
+                (shared::events::PROPOSAL_EXPIRED,),
+                (proposal_id, env.ledger().timestamp()),
+            );
+            return Err(Error::ProposalExpired);
+        }
+
         let threshold: u32 = instance_get(&env, &KEY_THRESHOLD).unwrap_or(0);
         if proposal.approval_count < threshold {
             return Err(Error::BelowThreshold);
@@ -372,6 +414,38 @@ impl GovernanceContract {
             env.ledger().timestamp(),
         );
 
+        Ok(())
+    }
+
+    /// Cancel a pending proposal before it is executed. The original proposer
+    /// or the configured super-admin may cancel it.
+    pub fn cancel(env: Env, caller: Address, proposal_id: u64) -> Result<(), Error> {
+        let proposal_key = (KEY_PROPOSAL, proposal_id);
+        let mut proposal: Proposal =
+            instance_get(&env, &proposal_key).ok_or(Error::ProposalNotFound)?;
+        let super_admin = shared::auth::get_admin(&env);
+        if caller != proposal.proposer && caller != super_admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        if proposal.status != ProposalStatus::Pending {
+            return Err(Error::ProposalCancelled);
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            proposal.status = ProposalStatus::Expired;
+            instance_set(&env, &proposal_key, &proposal);
+            env.events().publish(
+                (shared::events::PROPOSAL_EXPIRED,),
+                (proposal_id, env.ledger().timestamp()),
+            );
+            return Err(Error::ProposalExpired);
+        }
+        proposal.status = ProposalStatus::Cancelled;
+        instance_set(&env, &proposal_key, &proposal);
+        env.events().publish(
+            (shared::events::PROPOSAL_CANCELLED,),
+            (proposal_id, caller, env.ledger().timestamp()),
+        );
         Ok(())
     }
 
@@ -447,17 +521,13 @@ impl GovernanceContract {
 
 /// Requires the caller to hold the `Admin` role.
 fn require_admin_role(env: &Env, caller: &Address) -> ContractResult<()> {
-    auth::require_role(env, caller, Role::Admin)
+    auth::require_permission(env, caller, shared::auth::Permission::ManageRoles)
 }
 
 /// Requires the caller to be the admin (for backward-compatible parameter
 /// management).
 fn require_governance(env: &Env, caller: &Address) -> ContractResult<()> {
-    if *caller != shared::auth::get_admin(env) {
-        return Err(Error::Unauthorized);
-    }
-    caller.require_auth();
-    Ok(())
+    auth::require_permission(env, caller, shared::auth::Permission::ManageConfiguration)
 }
 
 fn seed_defaults(env: &Env) {
@@ -557,6 +627,7 @@ fn action_symbol(action: &ProposalAction) -> Symbol {
         ProposalAction::GrantRole(..) => symbol_short!("grt_role"),
         ProposalAction::RevokeRole(..) => symbol_short!("rvk_role"),
         ProposalAction::SetParameter(..) => symbol_short!("set_param"),
+        ProposalAction::SetTargetParameter(..) => symbol_short!("set_tgt"),
         ProposalAction::Pause => symbol_short!("pause"),
         ProposalAction::Unpause => symbol_short!("unpause"),
     }
@@ -570,6 +641,8 @@ fn role_name(role: &Role) -> Symbol {
         Role::Pauser => symbol_short!("pauser"),
         Role::ReferralManager => symbol_short!("refrl_m"),
         Role::OracleSigner => symbol_short!("oracle_s"),
+        Role::EndUser => symbol_short!("end_user"),
+        Role::ServiceActor => symbol_short!("svc_actor"),
     }
 }
 
@@ -592,6 +665,16 @@ fn execute_action(env: &Env, action: &ProposalAction) -> ContractResult<()> {
             validate_param(key, *value)?;
             write_param(env, key, *value);
         }
+        ProposalAction::SetTargetParameter(target, function_name, key, value) => {
+            validate_param(key, *value)?;
+            let args = vec![env, key.clone().into_val(env), (*value).into_val(env)];
+            match env.try_invoke_contract::<(), Error>(target, function_name, args) {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(Error::InvalidArgument),
+                Err(Ok(error)) => return Err(error),
+                Err(Err(_)) => return Err(Error::InvalidArgument),
+            }
+        }
         ProposalAction::Pause => {
             shared::storage::set_paused(env, true);
         }
@@ -611,7 +694,7 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
     use soroban_sdk::{Env, IntoVal, TryFromVal};
 
     /// Creates a 2-of-2 governance setup. Returns (env, client, admin).
@@ -687,6 +770,23 @@ mod tests {
         assert_eq!(result, Err(Ok(Error::InvalidArgument)));
     }
 
+    #[test]
+    fn initialize_rejects_admin_set_over_the_iteration_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, GovernanceContract);
+        let client = GovernanceContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let admin_set = make_admin_set(&env, MAX_GOVERNANCE_ADMINS as usize + 1);
+
+        assert_eq!(
+            client.try_initialize(&admin, &1, &admin_set),
+            Err(Ok(Error::InvalidArgument))
+        );
+        assert_eq!(client.get_admin_set().len(), 0);
+        assert_eq!(client.get_threshold(), 0);
+    }
+
     // -----------------------------------------------------------------------
     // grant_role / revoke_role
     // -----------------------------------------------------------------------
@@ -753,6 +853,7 @@ mod tests {
         assert_eq!(proposal.action, ProposalAction::Pause);
         assert_eq!(proposal.approval_count, 0);
         assert_eq!(proposal.status, ProposalStatus::Pending);
+        assert_eq!(proposal.expires_at, proposal.created_at + PROPOSAL_LIFETIME);
     }
 
     #[test]
@@ -841,6 +942,44 @@ mod tests {
 
         let result = client.try_execute(&admin, &proposal_id);
         assert_eq!(result, Err(Ok(Error::AlreadyExecuted)));
+    }
+
+    #[test]
+    fn proposer_can_cancel_pending_proposal() {
+        let (_env, client, admin) = setup();
+        let proposal_id = client.propose(&admin, &ProposalAction::Pause);
+        client.cancel(&admin, &proposal_id);
+        assert_eq!(
+            client.get_proposal(&proposal_id).status,
+            ProposalStatus::Cancelled
+        );
+        assert_eq!(
+            client.try_execute(&admin, &proposal_id),
+            Err(Ok(Error::ProposalCancelled))
+        );
+    }
+
+    #[test]
+    fn expired_proposal_cannot_be_approved_or_executed() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let proposal_id = client.propose(&admin, &ProposalAction::Pause);
+        env.ledger().set_timestamp(PROPOSAL_LIFETIME + 1);
+        assert_eq!(
+            client.try_approve(&admin, &proposal_id),
+            Err(Ok(Error::ProposalExpired))
+        );
+        assert_eq!(
+            client.get_proposal(&proposal_id).status,
+            // The failing invocation is rolled back by Soroban, so the
+            // stored proposal remains pending; its expiry is checked again
+            // on the next state-changing call.
+            ProposalStatus::Pending
+        );
+        assert_eq!(
+            client.try_execute(&second_admin, &proposal_id),
+            Err(Ok(Error::ProposalExpired))
+        );
     }
 
     #[test]
@@ -1038,6 +1177,21 @@ mod tests {
         assert_eq!(result, Err(Ok(Error::InvalidArgument)));
     }
 
+    #[test]
+    fn set_admin_set_rejects_over_limit_without_changing_current_configuration() {
+        let (env, client, admin) = setup();
+        let previous_admins = client.get_admin_set();
+        let previous_threshold = client.get_threshold();
+        let oversized = make_admin_set(&env, MAX_GOVERNANCE_ADMINS as usize + 1);
+
+        assert_eq!(
+            client.try_set_admin_set(&admin, &oversized, &1),
+            Err(Ok(Error::InvalidArgument))
+        );
+        assert_eq!(client.get_admin_set(), previous_admins);
+        assert_eq!(client.get_threshold(), previous_threshold);
+    }
+
     // -----------------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------------
@@ -1196,5 +1350,362 @@ mod tests {
             client.try_get_bounds(&ParameterKey::ReferralTierBps(11)),
             Err(Ok(Error::InvalidArgument))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorization matrix
+    //
+    // Every privileged entrypoint below is exercised with an authorized
+    // actor (allow) and an unauthorized actor (deny). Revoked and expired
+    // actors are covered explicitly where the contract supports them.
+    //
+    // Privileged entrypoints and their required roles:
+    //   * initialize      — one-shot bootstrap (no prior role required)
+    //   * grant_role      — Admin (ManageRoles)
+    //   * revoke_role     — Admin (ManageRoles)
+    //   * set_admin_set   — Admin (ManageRoles)
+    //   * propose         — Admin (ManageRoles)
+    //   * approve         — Admin (ManageRoles)
+    //   * execute         — Admin (ManageRoles)
+    //   * cancel          — proposer or super-admin
+    //   * set_param       — Admin (ManageConfiguration)
+    // -----------------------------------------------------------------------
+
+    /// Builds a governance instance with a single admin and a stranger.
+    fn setup_with_stranger() -> (Env, GovernanceContractClient<'static>, Address, Address) {
+        let (env, client, admin) = setup();
+        let stranger = Address::generate(&env);
+        (env, client, admin, stranger)
+    }
+
+    // --- initialize ---------------------------------------------------------
+
+    #[test]
+    fn initialize_allows_first_caller_and_denies_double_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, GovernanceContract);
+        let client = GovernanceContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let mut admin_set: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+        admin_set.push_back(admin.clone());
+
+        // allow: first initialization succeeds
+        client.initialize(&admin, &1, &admin_set);
+        assert!(client.has_role(&admin, &Role::Admin));
+
+        // deny: re-initialization is rejected by the shared auth layer
+        let result = client.try_initialize(&admin, &1, &admin_set);
+        assert!(result.is_err());
+    }
+
+    // --- grant_role ---------------------------------------------------------
+
+    #[test]
+    fn grant_role_allow_admin_deny_stranger() {
+        let (env, client, admin, stranger) = setup_with_stranger();
+        let user = Address::generate(&env);
+
+        // allow
+        client.grant_role(&admin, &user, &Role::Upgrader);
+        assert!(client.has_role(&user, &Role::Upgrader));
+
+        // deny
+        let other = Address::generate(&env);
+        assert_eq!(
+            client.try_grant_role(&stranger, &other, &Role::Upgrader),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert!(!client.has_role(&other, &Role::Upgrader));
+    }
+
+    #[test]
+    fn grant_role_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let admins = client.get_admin_set();
+        let second_admin = admins.get(1).unwrap();
+        let user = Address::generate(&env);
+
+        // Revoke the second admin's Admin role.
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+        assert!(!client.has_role(&second_admin, &Role::Admin));
+
+        // deny: revoked admin can no longer grant roles
+        assert_eq!(
+            client.try_grant_role(&second_admin, &user, &Role::Upgrader),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    // --- revoke_role --------------------------------------------------------
+
+    #[test]
+    fn revoke_role_allow_admin_deny_stranger() {
+        let (env, client, admin, stranger) = setup_with_stranger();
+        let user = Address::generate(&env);
+
+        client.grant_role(&admin, &user, &Role::Pauser);
+
+        // allow
+        client.revoke_role(&admin, &user, &Role::Pauser);
+        assert!(!client.has_role(&user, &Role::Pauser));
+
+        // deny
+        client.grant_role(&admin, &user, &Role::Pauser);
+        assert_eq!(
+            client.try_revoke_role(&stranger, &user, &Role::Pauser),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert!(client.has_role(&user, &Role::Pauser));
+    }
+
+    #[test]
+    fn revoke_role_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let user = Address::generate(&env);
+
+        client.grant_role(&admin, &user, &Role::Pauser);
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_revoke_role(&second_admin, &user, &Role::Pauser),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert!(client.has_role(&user, &Role::Pauser));
+    }
+
+    // --- set_admin_set ------------------------------------------------------
+
+    #[test]
+    fn set_admin_set_allow_admin_deny_stranger() {
+        let (env, client, admin, stranger) = setup_with_stranger();
+        let new_admins = make_admin_set(&env, 2);
+
+        // allow
+        client.set_admin_set(&admin, &new_admins, &1);
+        assert_eq!(client.get_threshold(), 1);
+        assert_eq!(client.get_admin_set().len(), 2);
+
+        // deny
+        let other = make_admin_set(&env, 1);
+        assert_eq!(
+            client.try_set_admin_set(&stranger, &other, &1),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn set_admin_set_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let new_admins = make_admin_set(&env, 1);
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_set_admin_set(&second_admin, &new_admins, &1),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    // --- propose ------------------------------------------------------------
+
+    #[test]
+    fn propose_allow_admin_deny_stranger() {
+        let (_env, client, admin, stranger) = setup_with_stranger();
+
+        // allow
+        let id = client.propose(&admin, &ProposalAction::Pause);
+        assert_eq!(client.get_proposal(&id).status, ProposalStatus::Pending);
+
+        // deny
+        assert_eq!(
+            client.try_propose(&stranger, &ProposalAction::Pause),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn propose_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_propose(&second_admin, &ProposalAction::Pause),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    // --- approve ------------------------------------------------------------
+
+    #[test]
+    fn approve_allow_admin_deny_stranger() {
+        let (env, client, admin, stranger) = setup_with_stranger();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+
+        // allow
+        client.approve(&admin, &id);
+        assert_eq!(client.get_proposal(&id).approval_count, 1);
+
+        // deny
+        assert_eq!(
+            client.try_approve(&stranger, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn approve_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_approve(&second_admin, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn approve_denies_expired_proposal() {
+        let (env, client, admin) = setup();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+        env.ledger().set_timestamp(PROPOSAL_LIFETIME + 1);
+
+        assert_eq!(
+            client.try_approve(&admin, &id),
+            Err(Ok(Error::ProposalExpired))
+        );
+    }
+
+    // --- execute ------------------------------------------------------------
+
+    #[test]
+    fn execute_allow_admin_deny_stranger() {
+        let (env, client, admin, stranger) = setup_with_stranger();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+        client.approve(&admin, &id);
+        client.approve(&second_admin, &id);
+
+        // deny
+        assert_eq!(
+            client.try_execute(&stranger, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+
+        // allow
+        client.execute(&admin, &id);
+        assert_eq!(
+            client.get_proposal(&id).status,
+            ProposalStatus::Executed
+        );
+    }
+
+    #[test]
+    fn execute_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+        client.approve(&admin, &id);
+        client.approve(&second_admin, &id);
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_execute(&second_admin, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn execute_denies_expired_proposal() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+        client.approve(&admin, &id);
+        client.approve(&second_admin, &id);
+        env.ledger().set_timestamp(PROPOSAL_LIFETIME + 1);
+
+        assert_eq!(
+            client.try_execute(&admin, &id),
+            Err(Ok(Error::ProposalExpired))
+        );
+    }
+
+    // --- cancel -------------------------------------------------------------
+
+    #[test]
+    fn cancel_allow_proposer_deny_stranger() {
+        let (_env, client, admin, stranger) = setup_with_stranger();
+        let id = client.propose(&admin, &ProposalAction::Pause);
+
+        // deny
+        assert_eq!(
+            client.try_cancel(&stranger, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+
+        // allow
+        client.cancel(&admin, &id);
+        assert_eq!(
+            client.get_proposal(&id).status,
+            ProposalStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancel_denies_revoked_proposer() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let id = client.propose(&second_admin, &ProposalAction::Pause);
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_cancel(&second_admin, &id),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    // --- set_param ----------------------------------------------------------
+
+    #[test]
+    fn set_param_allow_admin_deny_stranger() {
+        let (_env, client, admin, stranger) = setup_with_stranger();
+
+        // allow
+        client.set_param(&admin, &ParameterKey::AidDefaultExpiry, &120);
+        assert_eq!(client.aid_default_expiry(), 120);
+
+        // deny
+        assert_eq!(
+            client.try_set_param(&stranger, &ParameterKey::AidDefaultExpiry, &240),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(client.aid_default_expiry(), 120);
+    }
+
+    #[test]
+    fn set_param_denies_revoked_admin() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+
+        client.revoke_role(&admin, &second_admin, &Role::Admin);
+
+        assert_eq!(
+            client.try_set_param(
+                &second_admin,
+                &ParameterKey::AidDefaultExpiry,
+                &120
+            ),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(client.aid_default_expiry(), DEFAULT_AID_DEFAULT_EXPIRY);
     }
 }
