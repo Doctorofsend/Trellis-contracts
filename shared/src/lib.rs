@@ -22,6 +22,7 @@ pub mod feature_flags;
 pub mod health;
 pub mod history;
 pub mod idempotency;
+pub mod impersonation;
 pub mod import;
 pub mod jobs;
 pub mod lifecycle;
@@ -155,6 +156,14 @@ pub use timeline::{
     record_action_audit_event, record_audit_event, redact_entry, timeline_page, viewer_for,
     ActionAuditEntry, AuditEntry, ResourceLink, TimelineEntry, TimelineEventType, TimelineKey,
     TimelinePage, Viewer, Visibility, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_SCAN_PER_PAGE,
+};
+pub use impersonation::{
+    check_action_permission, create_session, get_active_sessions_for_impersonator,
+    get_active_sessions_for_user, get_current_impersonation, is_being_impersonated,
+    record_action, revoke_session, validate_session,
+    ImpersonationAction, ImpersonationError, ImpersonationScope, ImpersonationSession,
+    ResourceScope, ResourceType, SessionParams, SessionResult, SessionState,
+    MAX_CONCURRENT_SESSIONS, MAX_SESSION_DURATION, DEFAULT_SESSION_DURATION,
 };
 pub use canonical::{
     canonical_bytes, canonical_fingerprint, canonicalize_legacy, ensure_supported_encoding,

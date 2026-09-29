@@ -32,6 +32,8 @@ pub enum Role {
     EndUser,
     /// Authorised service or contract actor.
     ServiceActor,
+    /// Authorised to perform scoped impersonation for support debugging.
+    Support,
 }
 
 /// Named capabilities mapped centrally to the role required to exercise them.
@@ -58,6 +60,8 @@ pub enum Permission {
     ReadAuditTrail,
     /// Perform an explicitly registered service operation.
     ServiceOperation,
+    /// Perform scoped impersonation for support debugging.
+    ImpersonateUser,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +228,7 @@ pub fn role_for_permission(permission: Permission) -> Role {
         Permission::SubmitOracle => Role::OracleSigner,
         Permission::UpgradeContracts => Role::Upgrader,
         Permission::ServiceOperation => Role::ServiceActor,
+        Permission::ImpersonateUser => Role::Support,
     }
 }
 
