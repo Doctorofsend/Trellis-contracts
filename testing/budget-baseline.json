@@ -1,0 +1,28 @@
+{
+  "description": "Baseline Soroban CPU-instruction / memory-byte costs for the contract calls profiled by scripts/profile-budget.sh (Issue #192). Regenerate with `./scripts/profile-budget.sh --update-baseline` and record why in the PR.",
+  "generated_at": "2026-09-29",
+  "threshold_percent_default": 10,
+  "unmeasured_note": "treasury.withdraw, referral.register, and rebalancer.rebalance have placeholder (0, 0) entries below rather than real measurements, because each contract has a distinct, pre-existing build/test breakage unrelated to issue #192: (1) referral-contract and rebalancer-contract fail to build in ANY profile (not just tests) because contracts/referral-contract/src/lib.rs and contracts/rebalancer-contract/src/{lib.rs,logging.rs} call shared::events::emit_action_executed with its pre-issue-#151 six-argument signature; that function gained a `correlation_id: &BytesN<32>` parameter in commit 2ff889d / PR #194 and these call sites were never updated. rebalancer-contract additionally has a malformed `#[!cfg(test)]` attribute (should be `#![cfg(test)]`) and references a nonexistent `soroban_std` crate (almost certainly meant `soroban_sdk`) in contracts/rebalancer-contract/src/tests.rs. (2) treasury-contract builds fine normally, but its EXISTING contracts/treasury-contract/src/test.rs (not this issue's budget_test.rs or profile_budget.rs) fails to compile: it calls try_schedule_withdraw with a stale argument list, references a nonexistent shared::Error::ActionNotYetValid variant, and calls .unwrap() on a soroban_sdk::Vec return value that has no such method. Because test.rs is compiled together with the rest of the crate's #[cfg(test)] code, this also currently blocks the pre-existing budget_test.rs from issue #158 from running, not just this issue's profile_budget.rs. None of this was introduced by issue #192 and none of it was fixed here; all three profile_budget.rs harnesses (contracts/{treasury,referral,rebalancer}-contract/src/profile_budget.rs) are already written correctly and will start reporting real numbers the moment each contract's own breakage is fixed -- run `./scripts/profile-budget.sh --update-baseline` at that point. Until then scripts/compare-budget.cjs reports them as MISSING every run rather than silently dropping them, and MISSING never fails the job.",
+  "metrics": {
+    "aid.claim_aid": {
+      "cpu_instructions": 319184,
+      "memory_bytes": 47781
+    },
+    "aid.create_aid": {
+      "cpu_instructions": 397995,
+      "memory_bytes": 64237
+    },
+    "treasury.withdraw": {
+      "cpu_instructions": 0,
+      "memory_bytes": 0
+    },
+    "referral.register": {
+      "cpu_instructions": 0,
+      "memory_bytes": 0
+    },
+    "rebalancer.rebalance": {
+      "cpu_instructions": 0,
+      "memory_bytes": 0
+    }
+  }
+}

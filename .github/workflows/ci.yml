@@ -321,3 +321,37 @@ jobs:
           name: security-audit-report
           path: security-report.md
           if-no-files-found: ignore
+
+  # Soroban CPU-instruction / memory-byte footprint profiling (Issue #192).
+  # Measures env.budget() cost for the hottest entry point in each of
+  # aid-contract, treasury-contract, referral-contract, and
+  # rebalancer-contract (see contracts/*/src/profile_budget.rs) and compares
+  # it against the checked-in baseline in testing/budget-baseline.json.
+  # Fails when a call regresses by more than BUDGET_REGRESSION_THRESHOLD_PERCENT
+  # (default 10%, tunable via the repository variable of the same name without
+  # editing this workflow). See docs/OBSERVABILITY.md, "Automated Budget
+  # Profiling", for how to update the baseline.
+  profile-budget:
+    name: Budget Profile
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      BUDGET_REGRESSION_THRESHOLD_PERCENT: ${{ vars.BUDGET_REGRESSION_THRESHOLD_PERCENT || '10' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Profile budget and compare against baseline
+        run: ./scripts/profile-budget.sh --threshold "$BUDGET_REGRESSION_THRESHOLD_PERCENT"

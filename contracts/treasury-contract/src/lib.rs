@@ -764,3 +764,9 @@ mod test;
 /// thresholds can be read (and updated) independently.
 #[cfg(test)]
 mod budget_test;
+
+/// CPU/memory footprint profiling for CI (issue #192). Complements
+/// `budget_test` (issue #158) with a plain, unthresholded measurement that
+/// `scripts/profile-budget.sh` compares against a checked-in baseline.
+#[cfg(test)]
+mod profile_budget;

@@ -658,6 +658,11 @@ fn call_treasury_distribute_reward(
     }
 }
 
+/// CPU/memory footprint profiling for CI (issue #192). Kept separate from
+/// `tests` so it can be run in isolation via `scripts/profile-budget.sh`.
+#[cfg(test)]
+mod profile_budget;
+
 #[cfg(test)]
 mod tests {
     extern crate std;
