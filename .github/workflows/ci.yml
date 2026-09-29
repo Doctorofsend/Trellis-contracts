@@ -8,6 +8,8 @@ on:
   # Weekly re-scan so advisories published after merge still surface.
   schedule:
     - cron: "0 6 * * 1"
+  # Allows manually triggering the weekly-scheduled jobs (e.g. fuzz-cross-contract).
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -280,6 +282,37 @@ jobs:
           name: coverage-report
           path: json-coverage.json
           if-no-files-found: ignore
+
+  # Cross-contract state fuzzing (Issue #191): stateful proptest harness that
+  # drives randomized sequences across the real aid/treasury/referral
+  # contracts and checks global token-conservation and referral commission
+  # invariants. Runs 1,000+ operations per invocation, so it's kept off the
+  # push/PR critical path and scheduled weekly (with manual dispatch).
+  fuzz-cross-contract:
+    name: Cross-Contract State Fuzzing
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Run cross-contract fuzzing harness
+        run: |
+          cargo test -p testing cross_contract_fuzz:: -- --nocapture
 
   # Security audit: cargo audit + clippy security preset (see security/README.md).
   # BLOCKING: any high-severity finding (every RustSec vulnerability, panic-family
