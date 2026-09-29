@@ -253,3 +253,204 @@ where
 {
     env.events().all().iter().filter(predicate).count()
 }
+
+// -----------------------------------------------------------------------------
+// Contract State Snapshot Helpers
+// -----------------------------------------------------------------------------
+
+/// A deterministic snapshot of a single account's token balance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BalanceSnapshot {
+    pub account: Address,
+    pub balance: i128,
+}
+
+/// A deterministic snapshot of a contract's ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipSnapshot {
+    pub owner: Option<Address>,
+}
+
+/// A deterministic snapshot of a contract's status flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSnapshot {
+    pub status: u32,
+}
+
+/// A deterministic snapshot of a contract's metadata entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataSnapshot {
+    pub entries: Vec<(String, String)>,
+}
+
+/// A composite snapshot capturing balances, ownership, status, and metadata.
+///
+/// Snapshots are compared with `PartialEq`, which yields deterministic
+/// results because all collections are stored in a canonical order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractStateSnapshot {
+    pub balances: Vec<BalanceSnapshot>,
+    pub ownership: OwnershipSnapshot,
+    pub status: StatusSnapshot,
+    pub metadata: MetadataSnapshot,
+}
+
+impl ContractStateSnapshot {
+    /// Build a snapshot from explicit components.
+    pub fn new(
+        balances: Vec<BalanceSnapshot>,
+        ownership: OwnershipSnapshot,
+        status: StatusSnapshot,
+        metadata: MetadataSnapshot,
+    ) -> Self {
+        Self {
+            balances,
+            ownership,
+            status,
+            metadata,
+        }
+    }
+
+    /// Capture a snapshot of token balances for the given accounts.
+    pub fn capture_balances(
+        token_client: &token::Client,
+        accounts: &[Address],
+    ) -> Vec<BalanceSnapshot> {
+        let mut balances: Vec<BalanceSnapshot> = accounts
+            .iter()
+            .map(|account| BalanceSnapshot {
+                account: account.clone(),
+                balance: token_client.balance(account),
+            })
+            .collect();
+        balances.sort_by(|a, b| a.account.cmp(&b.account));
+        balances
+    }
+
+    /// Capture a full snapshot from the provided components.
+    pub fn capture(
+        token_client: &token::Client,
+        accounts: &[Address],
+        owner: Option<Address>,
+        status: u32,
+        metadata: Vec<(String, String)>,
+    ) -> Self {
+        let mut metadata = metadata;
+        metadata.sort_by(|a, b| a.0.cmp(&b.0));
+        Self {
+            balances: Self::capture_balances(token_client, accounts),
+            ownership: OwnershipSnapshot { owner },
+            status: StatusSnapshot { status },
+            metadata: MetadataSnapshot { entries: metadata },
+        }
+    }
+}
+
+/// A single expected delta between two snapshots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateDelta {
+    BalanceChanged {
+        account: Address,
+        before: i128,
+        after: i128,
+    },
+    OwnershipChanged {
+        before: Option<Address>,
+        after: Option<Address>,
+    },
+    StatusChanged { before: u32, after: u32 },
+    MetadataChanged {
+        key: String,
+        before: Option<String>,
+        after: Option<String>,
+    },
+}
+
+/// Compute the deterministic set of deltas between two snapshots.
+pub fn diff_snapshots(
+    before: &ContractStateSnapshot,
+    after: &ContractStateSnapshot,
+) -> Vec<StateDelta> {
+    let mut deltas = Vec::new();
+
+    for b in &before.balances {
+        if let Some(a) = after.balances.iter().find(|x| x.account == b.account) {
+            if a.balance != b.balance {
+                deltas.push(StateDelta::BalanceChanged {
+                    account: b.account.clone(),
+                    before: b.balance,
+                    after: a.balance,
+                });
+            }
+        }
+    }
+
+    if before.ownership != after.ownership {
+        deltas.push(StateDelta::OwnershipChanged {
+            before: before.ownership.owner.clone(),
+            after: after.ownership.owner.clone(),
+        });
+    }
+
+    if before.status != after.status {
+        deltas.push(StateDelta::StatusChanged {
+            before: before.status.status,
+            after: after.status.status,
+        });
+    }
+
+    let mut keys: Vec<&String> = before
+        .metadata
+        .entries
+        .iter()
+        .map(|(k, _)| k)
+        .chain(after.metadata.entries.iter().map(|(k, _)| k))
+        .collect();
+    keys.sort();
+    keys.dedup();
+
+    for key in keys {
+        let b = before
+            .metadata
+            .entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone());
+        let a = after
+            .metadata
+            .entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone());
+        if a != b {
+            deltas.push(StateDelta::MetadataChanged {
+                key: key.clone(),
+                before: b,
+                after: a,
+            });
+        }
+    }
+
+    deltas
+}
+
+/// Assert that the observed deltas exactly match the expected deltas.
+///
+/// Fails with a deterministic, human-readable diff when they do not match.
+pub fn assert_state_delta(
+    before: &ContractStateSnapshot,
+    after: &ContractStateSnapshot,
+    expected: &[StateDelta],
+) {
+    let actual = diff_snapshots(before, after);
+    assert_eq!(
+        actual, expected,
+        "Unexpected contract state delta.\n  expected: {:?}\n  actual:   {:?}",
+        expected, actual
+    );
+}
+
+/// Assert that no state delta occurred between two snapshots.
+pub fn assert_no_state_delta(before: &ContractStateSnapshot, after: &ContractStateSnapshot) {
+    assert_state_delta(before, after, &[]);
+}

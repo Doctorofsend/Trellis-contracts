@@ -8,6 +8,9 @@ defines the payload, the metric names, and ready-to-use dashboard queries.
 See also [`DIAGNOSTICS.md`](./DIAGNOSTICS.md) for the local pre-flight script
 and [`RUNBOOK.md`](./RUNBOOK.md) for operational procedures.
 
+For snapshot-based contract state verification helpers used in high-risk test
+suites, see [`CONTRACT_STATE_SNAPSHOTS.md`](./CONTRACT_STATE_SNAPSHOTS.md).
+
 ## Operational Health Indicators
 
 The `shared::dashboard` module aggregates key indicators to track operational health:
@@ -190,3 +193,11 @@ soroban events \
 Indexers should key on `correlation_id` to join telemetry to the contract's
 typed events (for example `pay_esc_c` / `pay_esc_r`) when a human-auditable
 trail is needed.
+
+## Contract state snapshots
+
+Contract test suites use the snapshot helpers documented in
+[`CONTRACT_STATE_SNAPSHOTS.md`](./CONTRACT_STATE_SNAPSHOTS.md) to capture
+deterministic before/after state and assert expected deltas for balances,
+ownership, status, and metadata. Unexpected deltas fail tests with a
+structured diff of the observed changes.
