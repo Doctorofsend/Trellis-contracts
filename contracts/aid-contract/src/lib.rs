@@ -50,6 +50,7 @@ use soroban_sdk::{
 pub mod api;
 pub mod storage;
 pub mod types;
+pub mod correlation;
 
 use storage::{get_aid, get_aid_counter, has_aid, set_aid, set_aid_counter};
 
@@ -76,6 +77,8 @@ pub enum AidError {
     /// The aid has already been refunded to the donor.
     AlreadyRefunded = 106,
     CannotDeletePending = 107,
+    /// The supplied correlation ID is malformed or violates policy.
+    InvalidCorrelationId = 108,
 }
 
 #[contract]
@@ -207,6 +210,7 @@ impl AidContract {
         recipient: Address,
         amount: i128,
         expiry_ledger: u32,
+        correlation_id: Option<Bytes>,
     ) -> u64 {
         donor.require_auth();
 
@@ -217,6 +221,9 @@ impl AidContract {
         if expiry_ledger <= env.ledger().sequence() {
             panic_with_error!(&env, Error::InvalidArgument);
         }
+
+        // Validate/normalize the optional correlation ID before any state change.
+        let correlation_id = correlation::normalize(&env, correlation_id);
 
         // Quota enforcement (Issue #65): fail-open when unconfigured so
         // existing deployments keep working until maintainers set limits.
@@ -267,12 +274,20 @@ impl AidContract {
             amount,
             env.ledger().sequence().into(),
             expiry_ledger.into(),
+            correlation_id.clone(),
         );
 
         emit(
             &env,
             AID_CREATED,
-            (aid_id, donor.clone(), recipient, amount, expiry_ledger),
+            (
+                aid_id,
+                donor.clone(),
+                recipient,
+                amount,
+                expiry_ledger,
+                correlation_id.clone(),
+            ),
         );
         emit_action_executed(
             &env,
@@ -282,6 +297,7 @@ impl AidContract {
             true,
             env.ledger().timestamp(),
         );
+        correlation::store(&env, aid_id, &correlation_id);
         // Escrow funds from donor into contract.
         token::Client::new(&env, &token).transfer(&donor, &env.current_contract_address(), &amount);
 
@@ -308,6 +324,7 @@ impl AidContract {
         recipient.require_auth();
 
         let mut record = get_aid(&env, aid_id).ok_or(AidError::NotFound)?;
+        let correlation_id = correlation::load(&env, aid_id);
 
         // Sequence of checks ordered by likely failure rate (cheap first)
         if record.status == AidStatus::Settled || record.status == AidStatus::Refunded {
@@ -330,8 +347,8 @@ impl AidContract {
             &record.amount,
         );
 
-        emit(&env, AID_CLAIMED, aid_id);
-        emit(&env, AID_SETTLED, aid_id);
+        emit(&env, AID_CLAIMED, (aid_id, correlation_id.clone()));
+        emit(&env, AID_SETTLED, (aid_id, correlation_id.clone()));
         emit_action_executed(
             &env,
             symbol_short!("aid"),
@@ -386,7 +403,7 @@ impl AidContract {
             &record.amount,
         );
 
-        emit(&env, AID_REFUNDED, aid_id);
+        emit(&env, AID_REFUNDED, (aid_id, correlation_id.clone()));
         emit_action_executed(
             &env,
             symbol_short!("aid"),

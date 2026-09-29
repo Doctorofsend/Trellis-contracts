@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec};
 
 // Legacy single-topic constants retained for backward compatibility.
 pub const AID_CREATED: Symbol = symbol_short!("aid_crt");
@@ -43,6 +43,86 @@ pub const EVENT_LOG_INITIALIZED: Symbol = symbol_short!("evt_init");
 pub const EVENT_LOG_ACTION: Symbol = symbol_short!("evt_act");
 pub const EVENT_LOG_PERMISSION: Symbol = symbol_short!("evt_perm");
 
+// ---------------------------------------------------------------------------
+// Correlation ID support
+// ---------------------------------------------------------------------------
+
+/// Maximum length (in bytes) of a correlation ID.
+pub const CORRELATION_ID_MAX_LEN: u32 = 64;
+
+/// Minimum length (in bytes) of a correlation ID.
+pub const CORRELATION_ID_MIN_LEN: u32 = 8;
+
+/// Errors returned when validating a correlation ID.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CorrelationIdError {
+    /// The ID was empty or shorter than `CORRELATION_ID_MIN_LEN`.
+    TooShort = 1,
+    /// The ID exceeded `CORRELATION_ID_MAX_LEN` bytes.
+    TooLong = 2,
+    /// The ID contained a byte outside the allowed alphabet.
+    InvalidCharacter = 3,
+}
+
+/// Returns `true` if `byte` is permitted in a correlation ID.
+///
+/// Allowed alphabet: `0-9`, `A-Z`, `a-z`, `-`, `_`, `.`, `:`.
+#[inline]
+fn is_valid_correlation_byte(byte: u8) -> bool {
+    matches!(byte,
+        b'0'..=b'9'
+        | b'A'..=b'Z'
+        | b'a'..=b'z'
+        | b'-'
+        | b'_'
+        | b'.'
+        | b':'
+    )
+}
+
+/// Validates a correlation ID according to the canonical policy.
+///
+/// Policy:
+/// - Length must be within `[CORRELATION_ID_MIN_LEN, CORRELATION_ID_MAX_LEN]`.
+/// - Characters must be drawn from `[0-9A-Za-z._:-]`.
+///
+/// Returns `Ok(())` when valid, otherwise a `CorrelationIdError`.
+pub fn validate_correlation_id(id: &BytesN<32>) -> Result<(), CorrelationIdError> {
+    let bytes = id.to_array();
+    let mut len: u32 = 0;
+    for b in bytes.iter() {
+        if *b == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len < CORRELATION_ID_MIN_LEN {
+        return Err(CorrelationIdError::TooShort);
+    }
+    if len > CORRELATION_ID_MAX_LEN {
+        return Err(CorrelationIdError::TooLong);
+    }
+    for i in 0..len {
+        if !is_valid_correlation_byte(bytes[i as usize]) {
+            return Err(CorrelationIdError::InvalidCharacter);
+        }
+    }
+    Ok(())
+}
+
+/// Normalizes a correlation ID by rejecting invalid input.
+///
+/// The current policy is strict rejection: invalid IDs are surfaced as
+/// `CorrelationIdError` so callers can abort the workflow before emitting
+/// any correlated events.
+pub fn normalize_correlation_id(
+    id: &BytesN<32>,
+) -> Result<BytesN<32>, CorrelationIdError> {
+    validate_correlation_id(id)?;
+    Ok(id.clone())
+}
+
 /// Emits `AidCreated`.
 ///
 /// Topics: `("aid", "created")`
@@ -51,6 +131,7 @@ pub const EVENT_LOG_PERMISSION: Symbol = symbol_short!("evt_perm");
 /// `(aid_id, donor, recipient, amount, created_at, expires_at)`
 pub fn emit_aid_created(
     env: &Env,
+    correlation_id: &BytesN<32>,
     aid_id: u64,
     donor: &Address,
     recipient: &Address,
@@ -59,7 +140,7 @@ pub fn emit_aid_created(
     expires_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("aid"), symbol_short!("created")),
+        (symbol_short!("aid"), symbol_short!("created"), correlation_id.clone()),
         (
             aid_id,
             donor.clone(),
@@ -76,9 +157,15 @@ pub fn emit_aid_created(
 /// Topics: `("aid", "claimed")`
 ///
 /// Data: `(aid_id, claimant, claimed_at)`
-pub fn emit_aid_claimed(env: &Env, aid_id: u64, claimant: &Address, claimed_at: u64) {
+pub fn emit_aid_claimed(
+    env: &Env,
+    correlation_id: &BytesN<32>,
+    aid_id: u64,
+    claimant: &Address,
+    claimed_at: u64,
+) {
     env.events().publish(
-        (symbol_short!("aid"), symbol_short!("claimed")),
+        (symbol_short!("aid"), symbol_short!("claimed"), correlation_id.clone()),
         (aid_id, claimant.clone(), claimed_at),
     );
 }
@@ -90,13 +177,14 @@ pub fn emit_aid_claimed(env: &Env, aid_id: u64, claimant: &Address, claimed_at: 
 /// Data: `(aid_id, recipient, amount, settled_at)`
 pub fn emit_aid_settled(
     env: &Env,
+    correlation_id: &BytesN<32>,
     aid_id: u64,
     recipient: &Address,
     amount: i128,
     settled_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("aid"), symbol_short!("settled")),
+        (symbol_short!("aid"), symbol_short!("settled"), correlation_id.clone()),
         (aid_id, recipient.clone(), amount, settled_at),
     );
 }
@@ -106,9 +194,16 @@ pub fn emit_aid_settled(
 /// Topics: `("aid", "refunded")`
 ///
 /// Data: `(aid_id, donor, amount, refunded_at)`
-pub fn emit_aid_refunded(env: &Env, aid_id: u64, donor: &Address, amount: i128, refunded_at: u64) {
+pub fn emit_aid_refunded(
+    env: &Env,
+    correlation_id: &BytesN<32>,
+    aid_id: u64,
+    donor: &Address,
+    amount: i128,
+    refunded_at: u64,
+) {
     env.events().publish(
-        (symbol_short!("aid"), symbol_short!("refunded")),
+        (symbol_short!("aid"), symbol_short!("refunded"), correlation_id.clone()),
         (aid_id, donor.clone(), amount, refunded_at),
     );
 }
@@ -120,13 +215,14 @@ pub fn emit_aid_refunded(env: &Env, aid_id: u64, donor: &Address, amount: i128, 
 /// Data: `(recipient, amount, paid_at)`
 pub fn emit_commission_paid(
     env: &Env,
+    correlation_id: &BytesN<32>,
     recipient: &Address,
     token: &Address,
     amount: i128,
     paid_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("comm"), symbol_short!("paid")),
+        (symbol_short!("comm"), symbol_short!("paid"), correlation_id.clone()),
         (recipient.clone(), token.clone(), amount, paid_at),
     );
 }
@@ -138,6 +234,7 @@ pub fn emit_commission_paid(
 /// Data: `(category, depositor, token, amount, new_balance)`
 pub fn emit_treasury_deposit(
     env: &Env,
+    correlation_id: &BytesN<32>,
     category: Symbol,
     depositor: &Address,
     token: &Address,
@@ -145,7 +242,7 @@ pub fn emit_treasury_deposit(
     new_balance: i128,
 ) {
     env.events().publish(
-        (symbol_short!("treasury"), symbol_short!("deposit")),
+        (symbol_short!("treasury"), symbol_short!("deposit"), correlation_id.clone()),
         (category, depositor.clone(), token.clone(), amount, new_balance),
     );
 }
@@ -157,6 +254,7 @@ pub fn emit_treasury_deposit(
 /// Data: `(category, recipient, token, amount, remaining_balance)`
 pub fn emit_treasury_withdrawal(
     env: &Env,
+    correlation_id: &BytesN<32>,
     category: Symbol,
     recipient: &Address,
     token: &Address,
@@ -164,7 +262,7 @@ pub fn emit_treasury_withdrawal(
     remaining_balance: i128,
 ) {
     env.events().publish(
-        (symbol_short!("treasury"), symbol_short!("withdraw")),
+        (symbol_short!("treasury"), symbol_short!("withdraw"), correlation_id.clone()),
         (category, recipient.clone(), token.clone(), amount, remaining_balance),
     );
 }
@@ -174,9 +272,14 @@ pub fn emit_treasury_withdrawal(
 /// Topics: `("contract", "paused")`
 ///
 /// Data: `(actor, paused_at)`
-pub fn emit_contract_paused(env: &Env, actor: &Address, paused_at: u64) {
+pub fn emit_contract_paused(
+    env: &Env,
+    correlation_id: &BytesN<32>,
+    actor: &Address,
+    paused_at: u64,
+) {
     env.events().publish(
-        (symbol_short!("contract"), symbol_short!("paused")),
+        (symbol_short!("contract"), symbol_short!("paused"), correlation_id.clone()),
         (actor.clone(), paused_at),
     );
 }
@@ -186,9 +289,14 @@ pub fn emit_contract_paused(env: &Env, actor: &Address, paused_at: u64) {
 /// Topics: `("contract", "resumed")`
 ///
 /// Data: `(actor, resumed_at)`
-pub fn emit_contract_resumed(env: &Env, actor: &Address, resumed_at: u64) {
+pub fn emit_contract_resumed(
+    env: &Env,
+    correlation_id: &BytesN<32>,
+    actor: &Address,
+    resumed_at: u64,
+) {
     env.events().publish(
-        (symbol_short!("contract"), symbol_short!("resumed")),
+        (symbol_short!("contract"), symbol_short!("resumed"), correlation_id.clone()),
         (actor.clone(), resumed_at),
     );
 }
@@ -200,12 +308,13 @@ pub fn emit_contract_resumed(env: &Env, actor: &Address, resumed_at: u64) {
 /// Data: `(actor, wasm_hash, upgraded_at)`
 pub fn emit_contract_upgraded(
     env: &Env,
+    correlation_id: &BytesN<32>,
     actor: &Address,
     wasm_hash: &BytesN<32>,
     upgraded_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("contract"), symbol_short!("upgraded")),
+        (symbol_short!("contract"), symbol_short!("upgraded"), correlation_id.clone()),
         (actor.clone(), wasm_hash.clone(), upgraded_at),
     );
 }
@@ -231,13 +340,14 @@ pub struct ModuleInitializedEvent {
 /// Data: `(Symbol module, u32 version, Address caller, u64 initialized_at)`
 pub fn emit_module_initialized(
     env: &Env,
+    correlation_id: &BytesN<32>,
     module: Symbol,
     version: u32,
     caller: &Address,
     initialized_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("logging"), symbol_short!("init")),
+        (symbol_short!("logging"), symbol_short!("init"), correlation_id.clone()),
         (module, version, caller.clone(), initialized_at),
     );
 }
@@ -260,6 +370,7 @@ pub struct ActionExecutedEvent {
 /// Data: `(Symbol module, Symbol action, Address caller, bool success, u64 executed_at)`
 pub fn emit_action_executed(
     env: &Env,
+    correlation_id: &BytesN<32>,
     module: Symbol,
     action: Symbol,
     caller: &Address,
@@ -267,7 +378,7 @@ pub fn emit_action_executed(
     executed_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("logging"), symbol_short!("action")),
+        (symbol_short!("logging"), symbol_short!("action"), correlation_id.clone()),
         (module, action, caller.clone(), success, executed_at),
     );
 }
@@ -290,6 +401,7 @@ pub struct PermissionChangedEvent {
 /// Data: `(Symbol module, Symbol role, Address subject, bool granted, u64 changed_at)`
 pub fn emit_permission_changed(
     env: &Env,
+    correlation_id: &BytesN<32>,
     module: Symbol,
     role: Symbol,
     subject: &Address,
@@ -297,7 +409,7 @@ pub fn emit_permission_changed(
     changed_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("logging"), symbol_short!("perm")),
+        (symbol_short!("logging"), symbol_short!("perm"), correlation_id.clone()),
         (module, role, subject.clone(), granted, changed_at),
     );
 }
@@ -316,6 +428,7 @@ pub fn emit<T: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, topic: Sy
 /// Topics: ("upgrade", "registered")
 pub fn emit_contract_registered(
     env: &Env,
+    correlation_id: &BytesN<32>,
     contract_id: &Address,
     name: Symbol,
     version: u32,
@@ -323,7 +436,7 @@ pub fn emit_contract_registered(
     registered_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("upgrade"), symbol_short!("upg_reg")),
+        (symbol_short!("upgrade"), symbol_short!("upg_reg"), correlation_id.clone()),
         (
             contract_id.clone(),
             name,
@@ -337,6 +450,7 @@ pub fn emit_contract_registered(
 /// Topics: ("upgrade", "proposed")
 pub fn emit_upgrade_proposed(
     env: &Env,
+    correlation_id: &BytesN<32>,
     proposal_id: u64,
     contract_id: &Address,
     new_version: u32,
@@ -344,7 +458,7 @@ pub fn emit_upgrade_proposed(
     proposed_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("upgrade"), symbol_short!("proposed")),
+        (symbol_short!("upgrade"), symbol_short!("proposed"), correlation_id.clone()),
         (
             proposal_id,
             contract_id.clone(),
@@ -358,6 +472,7 @@ pub fn emit_upgrade_proposed(
 /// Topics: ("upgrade", "executed")
 pub fn emit_upgrade_executed(
     env: &Env,
+    correlation_id: &BytesN<32>,
     proposal_id: u64,
     contract_id: &Address,
     old_version: u32,
@@ -366,7 +481,7 @@ pub fn emit_upgrade_executed(
     executed_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("upgrade"), symbol_short!("executed")),
+        (symbol_short!("upgrade"), symbol_short!("executed"), correlation_id.clone()),
         (
             proposal_id,
             contract_id.clone(),
@@ -379,9 +494,15 @@ pub fn emit_upgrade_executed(
 }
 
 /// Topics: ("upgrade", "hook_set")
-pub fn emit_migration_hook_set(env: &Env, contract_id: &Address, hook_addr: &Address, set_at: u64) {
+pub fn emit_migration_hook_set(
+    env: &Env,
+    correlation_id: &BytesN<32>,
+    contract_id: &Address,
+    hook_addr: &Address,
+    set_at: u64,
+) {
     env.events().publish(
-        (symbol_short!("upgrade"), symbol_short!("hook_set")),
+        (symbol_short!("upgrade"), symbol_short!("hook_set"), correlation_id.clone()),
         (contract_id.clone(), hook_addr.clone(), set_at),
     );
 }
@@ -389,6 +510,7 @@ pub fn emit_migration_hook_set(env: &Env, contract_id: &Address, hook_addr: &Add
 /// Topics: ("upgrade", "rolledback")
 pub fn emit_upgrade_rolled_back(
     env: &Env,
+    correlation_id: &BytesN<32>,
     contract_id: &Address,
     from_version: u32,
     to_version: u32,
@@ -396,7 +518,7 @@ pub fn emit_upgrade_rolled_back(
     rolled_back_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("upgrade"), symbol_short!("rollback")),
+        (symbol_short!("upgrade"), symbol_short!("rollback"), correlation_id.clone()),
         (
             contract_id.clone(),
             from_version,
@@ -414,13 +536,14 @@ pub fn emit_upgrade_rolled_back(
 /// Data: `(admin, grantee, role_name, timestamp)`
 pub fn emit_role_granted(
     env: &Env,
+    correlation_id: &BytesN<32>,
     admin: &Address,
     grantee: &Address,
     role_name: Symbol,
     timestamp: u64,
 ) {
     env.events().publish(
-        (symbol_short!("role"), symbol_short!("granted")),
+        (symbol_short!("role"), symbol_short!("granted"), correlation_id.clone()),
         (admin.clone(), grantee.clone(), role_name, timestamp),
     );
 }
@@ -433,6 +556,7 @@ pub fn emit_role_granted(
 #[allow(clippy::too_many_arguments)]
 pub fn emit_nft_listed(
     env: &Env,
+    correlation_id: &BytesN<32>,
     listing_id: u64,
     seller: &Address,
     collection: &Address,
@@ -442,7 +566,7 @@ pub fn emit_nft_listed(
     listed_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("nft"), symbol_short!("listed")),
+        (symbol_short!("nft"), symbol_short!("listed"), correlation_id.clone()),
         (
             listing_id,
             seller.clone(),
@@ -458,6 +582,7 @@ pub fn emit_nft_listed(
 /// Topics: ("nft", "sold")
 pub fn emit_nft_sold(
     env: &Env,
+    correlation_id: &BytesN<32>,
     listing_id: u64,
     seller: &Address,
     buyer: &Address,
@@ -465,7 +590,7 @@ pub fn emit_nft_sold(
     sold_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("nft"), symbol_short!("sold")),
+        (symbol_short!("nft"), symbol_short!("sold"), correlation_id.clone()),
         (listing_id, seller.clone(), buyer.clone(), price, sold_at),
     );
 }
@@ -473,6 +598,7 @@ pub fn emit_nft_sold(
 /// Topics: ("nft", "offer")
 pub fn emit_nft_offer(
     env: &Env,
+    correlation_id: &BytesN<32>,
     offer_id: u64,
     offerer: &Address,
     token_id: u64,
@@ -480,15 +606,22 @@ pub fn emit_nft_offer(
     expires_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("nft"), symbol_short!("offer")),
+        (symbol_short!("nft"), symbol_short!("offer"), correlation_id.clone()),
         (offer_id, offerer.clone(), token_id, amount, expires_at),
     );
 }
 
 /// Topics: ("nft", "bid")
-pub fn emit_nft_bid(env: &Env, auction_id: u64, bidder: &Address, amount: i128, new_end: u64) {
+pub fn emit_nft_bid(
+    env: &Env,
+    correlation_id: &BytesN<32>,
+    auction_id: u64,
+    bidder: &Address,
+    amount: i128,
+    new_end: u64,
+) {
     env.events().publish(
-        (symbol_short!("nft"), symbol_short!("bid")),
+        (symbol_short!("nft"), symbol_short!("bid"), correlation_id.clone()),
         (auction_id, bidder.clone(), amount, new_end),
     );
 }
@@ -496,6 +629,7 @@ pub fn emit_nft_bid(env: &Env, auction_id: u64, bidder: &Address, amount: i128, 
 /// Topics: ("nft", "auction")
 pub fn emit_nft_auction(
     env: &Env,
+    correlation_id: &BytesN<32>,
     auction_id: u64,
     seller: &Address,
     collection: &Address,
@@ -504,7 +638,7 @@ pub fn emit_nft_auction(
     end_time: u64,
 ) {
     env.events().publish(
-        (symbol_short!("nft"), symbol_short!("auction")),
+        (symbol_short!("nft"), symbol_short!("auction"), correlation_id.clone()),
         (
             auction_id,
             seller.clone(),
@@ -519,13 +653,14 @@ pub fn emit_nft_auction(
 /// Topics: ("nft", "settle")
 pub fn emit_nft_settle(
     env: &Env,
+    correlation_id: &BytesN<32>,
     auction_id: u64,
     winner: &Address,
     final_price: i128,
     settled_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("nft"), symbol_short!("settle")),
+        (symbol_short!("nft"), symbol_short!("settle"), correlation_id.clone()),
         (auction_id, winner.clone(), final_price, settled_at),
     );
 }
@@ -533,13 +668,14 @@ pub fn emit_nft_settle(
 /// Topics: ("nft", "royal")
 pub fn emit_royalty_paid(
     env: &Env,
+    correlation_id: &BytesN<32>,
     token_id: u64,
     recipient: &Address,
     amount: i128,
     paid_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("nft"), symbol_short!("royal")),
+        (symbol_short!("nft"), symbol_short!("royal"), correlation_id.clone()),
         (token_id, recipient.clone(), amount, paid_at),
     );
 }
@@ -547,12 +683,13 @@ pub fn emit_royalty_paid(
 /// Topics: ("nft", "col_reg")
 pub fn emit_collection_registered(
     env: &Env,
+    correlation_id: &BytesN<32>,
     collection: &Address,
     admin: &Address,
     registered_at: u64,
 ) {
     env.events().publish(
-        (symbol_short!("nft"), symbol_short!("col_reg")),
+        (symbol_short!("nft"), symbol_short!("col_reg"), correlation_id.clone()),
         (collection.clone(), admin.clone(), registered_at),
     );
 }
@@ -564,13 +701,14 @@ pub fn emit_collection_registered(
 /// Data: `(admin, grantee, role_name, timestamp)`
 pub fn emit_role_revoked(
     env: &Env,
+    correlation_id: &BytesN<32>,
     admin: &Address,
     grantee: &Address,
     role_name: Symbol,
     timestamp: u64,
 ) {
     env.events().publish(
-        (symbol_short!("role"), symbol_short!("revoked")),
+        (symbol_short!("role"), symbol_short!("revoked"), correlation_id.clone()),
         (admin.clone(), grantee.clone(), role_name, timestamp),
     );
 }
@@ -582,13 +720,14 @@ pub fn emit_role_revoked(
 /// Data: `(proposal_id, proposer, action_description, timestamp)`
 pub fn emit_proposal_created(
     env: &Env,
+    correlation_id: &BytesN<32>,
     proposal_id: u64,
     proposer: &Address,
     action: Symbol,
     timestamp: u64,
 ) {
     env.events().publish(
-        (symbol_short!("proposal"), symbol_short!("created")),
+        (symbol_short!("proposal"), symbol_short!("created"), correlation_id.clone()),
         (proposal_id, proposer.clone(), action, timestamp),
     );
 }
@@ -600,13 +739,14 @@ pub fn emit_proposal_created(
 /// Data: `(proposal_id, approver, approval_count, timestamp)`
 pub fn emit_proposal_approved(
     env: &Env,
+    correlation_id: &BytesN<32>,
     proposal_id: u64,
     approver: &Address,
     approval_count: u32,
     timestamp: u64,
 ) {
     env.events().publish(
-        (symbol_short!("proposal"), symbol_short!("approved")),
+        (symbol_short!("proposal"), symbol_short!("approved"), correlation_id.clone()),
         (proposal_id, approver.clone(), approval_count, timestamp),
     );
 }
@@ -618,13 +758,14 @@ pub fn emit_proposal_approved(
 /// Data: `(proposal_id, executor, approval_count, timestamp)`
 pub fn emit_proposal_executed(
     env: &Env,
+    correlation_id: &BytesN<32>,
     proposal_id: u64,
     executor: &Address,
     approval_count: u32,
     timestamp: u64,
 ) {
     env.events().publish(
-        (symbol_short!("proposal"), symbol_short!("executed")),
+        (symbol_short!("proposal"), symbol_short!("executed"), correlation_id.clone()),
         (proposal_id, executor.clone(), approval_count, timestamp),
     );
 }
@@ -703,12 +844,15 @@ pub fn emit_import_failed(
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_action_executed, emit_aid_created, emit_module_initialized, emit_permission_changed,
+        emit_action_executed, emit_aid_created, emit_aid_claimed, emit_aid_settled,
+        emit_module_initialized, emit_permission_changed, normalize_correlation_id,
+        validate_correlation_id, CorrelationIdError, CORRELATION_ID_MAX_LEN,
+        CORRELATION_ID_MIN_LEN,
     };
     use soroban_sdk::{
         contract, contractimpl, symbol_short,
         testutils::{Address as _, Events},
-        Address, Env, FromVal, IntoVal, Symbol,
+        Address, BytesN, Env, FromVal, IntoVal, Symbol,
     };
 
     #[contract]
@@ -718,6 +862,7 @@ mod tests {
     impl EventTestContract {
         pub fn publish_aid_created(
             env: Env,
+            correlation_id: BytesN<32>,
             aid_id: u64,
             donor: Address,
             recipient: Address,
@@ -726,41 +871,96 @@ mod tests {
             expires_at: u64,
         ) {
             emit_aid_created(
-                &env, aid_id, &donor, &recipient, amount, created_at, expires_at,
+                &env, &correlation_id, aid_id, &donor, &recipient, amount, created_at, expires_at,
             );
         }
 
         pub fn publish_module_initialized(
             env: Env,
+            correlation_id: BytesN<32>,
             module: Symbol,
             version: u32,
             caller: Address,
             initialized_at: u64,
         ) {
-            emit_module_initialized(&env, module, version, &caller, initialized_at);
+            emit_module_initialized(
+                &env,
+                &correlation_id,
+                module,
+                version,
+                &caller,
+                initialized_at,
+            );
         }
 
         pub fn publish_action_executed(
             env: Env,
+            correlation_id: BytesN<32>,
             module: Symbol,
             action: Symbol,
             caller: Address,
             success: bool,
             executed_at: u64,
         ) {
-            emit_action_executed(&env, module, action, &caller, success, executed_at);
+            emit_action_executed(
+                &env,
+                &correlation_id,
+                module,
+                action,
+                &caller,
+                success,
+                executed_at,
+            );
         }
 
         pub fn publish_permission_changed(
             env: Env,
+            correlation_id: BytesN<32>,
             module: Symbol,
             role: Symbol,
             subject: Address,
             granted: bool,
             changed_at: u64,
         ) {
-            emit_permission_changed(&env, module, role, &subject, granted, changed_at);
+            emit_permission_changed(
+                &env,
+                &correlation_id,
+                module,
+                role,
+                &subject,
+                granted,
+                changed_at,
+            );
         }
+
+        pub fn publish_aid_claimed(
+            env: Env,
+            correlation_id: BytesN<32>,
+            aid_id: u64,
+            claimant: Address,
+            claimed_at: u64,
+        ) {
+            emit_aid_claimed(&env, &correlation_id, aid_id, &claimant, claimed_at);
+        }
+
+        pub fn publish_aid_settled(
+            env: Env,
+            correlation_id: BytesN<32>,
+            aid_id: u64,
+            recipient: Address,
+            amount: i128,
+            settled_at: u64,
+        ) {
+            emit_aid_settled(&env, &correlation_id, aid_id, &recipient, amount, settled_at);
+        }
+    }
+
+    fn cid(env: &Env, s: &str) -> BytesN<32> {
+        let mut buf = [0u8; 32];
+        let bytes = s.as_bytes();
+        assert!(bytes.len() <= 32, "test correlation id too long");
+        buf[..bytes.len()].copy_from_slice(bytes);
+        BytesN::from_array(env, &buf)
     }
 
     #[test]
@@ -768,10 +968,19 @@ mod tests {
         let env = Env::default();
         let donor = Address::generate(&env);
         let recipient = Address::generate(&env);
+        let correlation_id = cid(&env, "wf-aid-0001");
         let contract_id = env.register_contract(None, EventTestContract);
         let client = EventTestContractClient::new(&env, &contract_id);
 
-        client.publish_aid_created(&7, &donor, &recipient, &500, &100, &1_000);
+        client.publish_aid_created(
+            &correlation_id,
+            &7,
+            &donor,
+            &recipient,
+            &500,
+            &100,
+            &1_000,
+        );
 
         let events = env.events().all();
         assert_eq!(events.len(), 1);
@@ -781,7 +990,12 @@ mod tests {
         assert_eq!(emitter, contract_id);
         assert_eq!(
             topics,
-            (symbol_short!("aid"), symbol_short!("created"),).into_val(&env)
+            (
+                symbol_short!("aid"),
+                symbol_short!("created"),
+                correlation_id.clone(),
+            )
+                .into_val(&env)
         );
         let decoded_data: (u64, Address, Address, i128, u64, u64) = FromVal::from_val(&env, &data);
 
@@ -796,10 +1010,11 @@ mod tests {
         let env = Env::default();
         let module = symbol_short!("aid");
         let caller = Address::generate(&env);
+        let correlation_id = cid(&env, "wf-init-0001");
         let contract_id = env.register_contract(None, EventTestContract);
         let client = EventTestContractClient::new(&env, &contract_id);
 
-        client.publish_module_initialized(&module, &1, &caller, &1_000);
+        client.publish_module_initialized(&correlation_id, &module, &1, &caller, &1_000);
 
         let events = env.events().all();
         assert_eq!(events.len(), 1);
@@ -809,7 +1024,12 @@ mod tests {
         assert_eq!(emitter, contract_id);
         assert_eq!(
             topics,
-            (symbol_short!("logging"), symbol_short!("init"),).into_val(&env)
+            (
+                symbol_short!("logging"),
+                symbol_short!("init"),
+                correlation_id.clone(),
+            )
+                .into_val(&env)
         );
         let decoded_data: (Symbol, u32, Address, u64) = FromVal::from_val(&env, &data);
 
@@ -822,10 +1042,18 @@ mod tests {
         let module = symbol_short!("aid");
         let action = symbol_short!("create");
         let caller = Address::generate(&env);
+        let correlation_id = cid(&env, "wf-act-0001");
         let contract_id = env.register_contract(None, EventTestContract);
         let client = EventTestContractClient::new(&env, &contract_id);
 
-        client.publish_action_executed(&module, &action, &caller, &true, &1_000);
+        client.publish_action_executed(
+            &correlation_id,
+            &module,
+            &action,
+            &caller,
+            &true,
+            &1_000,
+        );
 
         let events = env.events().all();
         assert_eq!(events.len(), 1);
@@ -834,7 +1062,12 @@ mod tests {
 
         assert_eq!(
             topics,
-            (symbol_short!("logging"), symbol_short!("action"),).into_val(&env)
+            (
+                symbol_short!("logging"),
+                symbol_short!("action"),
+                correlation_id.clone(),
+            )
+                .into_val(&env)
         );
         let decoded_data: (Symbol, Symbol, Address, bool, u64) = FromVal::from_val(&env, &data);
 
@@ -847,10 +1080,18 @@ mod tests {
         let module = symbol_short!("treasury");
         let role = symbol_short!("manager");
         let subject = Address::generate(&env);
+        let correlation_id = cid(&env, "wf-perm-0001");
         let contract_id = env.register_contract(None, EventTestContract);
         let client = EventTestContractClient::new(&env, &contract_id);
 
-        client.publish_permission_changed(&module, &role, &subject, &true, &1_000);
+        client.publish_permission_changed(
+            &correlation_id,
+            &module,
+            &role,
+            &subject,
+            &true,
+            &1_000,
+        );
 
         let events = env.events().all();
         assert_eq!(events.len(), 1);
@@ -859,10 +1100,152 @@ mod tests {
 
         assert_eq!(
             topics,
-            (symbol_short!("logging"), symbol_short!("perm"),).into_val(&env)
+            (
+                symbol_short!("logging"),
+                symbol_short!("perm"),
+                correlation_id.clone(),
+            )
+                .into_val(&env)
         );
         let decoded_data: (Symbol, Symbol, Address, bool, u64) = FromVal::from_val(&env, &data);
 
         assert_eq!(decoded_data, (module, role, subject.clone(), true, 1_000));
+    }
+
+    #[test]
+    fn validate_correlation_id_accepts_canonical_ids() {
+        let env = Env::default();
+        let id = cid(&env, "wf-2024-0001");
+        assert_eq!(validate_correlation_id(&id), Ok(()));
+    }
+
+    #[test]
+    fn validate_correlation_id_rejects_too_short() {
+        let env = Env::default();
+        let id = cid(&env, "abc");
+        assert_eq!(
+            validate_correlation_id(&id),
+            Err(CorrelationIdError::TooShort)
+        );
+        assert!(CORRELATION_ID_MIN_LEN > 3);
+    }
+
+    #[test]
+    fn validate_correlation_id_rejects_invalid_character() {
+        let env = Env::default();
+        let id = cid(&env, "wf id with space");
+        assert_eq!(
+            validate_correlation_id(&id),
+            Err(CorrelationIdError::InvalidCharacter)
+        );
+    }
+
+    #[test]
+    fn validate_correlation_id_accepts_max_length() {
+        let env = Env::default();
+        let s: String = core::iter::repeat('a')
+            .take(CORRELATION_ID_MAX_LEN as usize)
+            .collect();
+        let id = cid(&env, &s);
+        assert_eq!(validate_correlation_id(&id), Ok(()));
+    }
+
+    #[test]
+    fn normalize_correlation_id_rejects_invalid() {
+        let env = Env::default();
+        let id = cid(&env, "bad id!");
+        assert_eq!(
+            normalize_correlation_id(&id),
+            Err(CorrelationIdError::InvalidCharacter)
+        );
+    }
+
+    #[test]
+    fn normalize_correlation_id_passes_through_valid() {
+        let env = Env::default();
+        let id = cid(&env, "wf-valid-0001");
+        let normalized = normalize_correlation_id(&id).unwrap();
+        assert_eq!(normalized, id);
+    }
+
+    #[test]
+    fn multi_step_workflow_shares_correlation_id() {
+        let env = Env::default();
+        let donor = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let correlation_id = cid(&env, "wf-multi-0001");
+        let contract_id = env.register_contract(None, EventTestContract);
+        let client = EventTestContractClient::new(&env, &contract_id);
+
+        client.publish_aid_created(
+            &correlation_id,
+            &1,
+            &donor,
+            &recipient,
+            &500,
+            &100,
+            &1_000,
+        );
+        client.publish_aid_claimed(&correlation_id, &1, &recipient, &200);
+        client.publish_aid_settled(&correlation_id, &1, &recipient, &500, &300);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 3);
+
+        for i in 0..events.len() {
+            let (_emitter, topics, _data) = events.get(i).unwrap();
+            let decoded: (Symbol, Symbol, BytesN<32>) = FromVal::from_val(&env, &topics);
+            assert_eq!(decoded.2, correlation_id);
+        }
+    }
+
+    #[test]
+    fn single_step_workflow_has_correlation_id() {
+        let env = Env::default();
+        let donor = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let correlation_id = cid(&env, "wf-single-0001");
+        let contract_id = env.register_contract(None, EventTestContract);
+        let client = EventTestContractClient::new(&env, &contract_id);
+
+        client.publish_aid_created(
+            &correlation_id,
+            &1,
+            &donor,
+            &recipient,
+            &500,
+            &100,
+            &1_000,
+        );
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (_emitter, topics, _data) = events.get(0).unwrap();
+        let decoded: (Symbol, Symbol, BytesN<32>) = FromVal::from_val(&env, &topics);
+        assert_eq!(decoded.2, correlation_id);
+    }
+
+    #[test]
+    fn distinct_workflows_have_distinct_correlation_ids() {
+        let env = Env::default();
+        let donor = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let cid_a = cid(&env, "wf-a-0001");
+        let cid_b = cid(&env, "wf-b-0001");
+        let contract_id = env.register_contract(None, EventTestContract);
+        let client = EventTestContractClient::new(&env, &contract_id);
+
+        client.publish_aid_created(&cid_a, &1, &donor, &recipient, &500, &100, &1_000);
+        client.publish_aid_created(&cid_b, &2, &donor, &recipient, &600, &100, &1_000);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 2);
+        let (_e0, t0, _d0) = events.get(0).unwrap();
+        let (_e1, t1, _d1) = events.get(1).unwrap();
+        let d0: (Symbol, Symbol, BytesN<32>) = FromVal::from_val(&env, &t0);
+        let d1: (Symbol, Symbol, BytesN<32>) = FromVal::from_val(&env, &t1);
+        assert_ne!(d0.2, d1.2);
+        assert_eq!(d0.2, cid_a);
+        assert_eq!(d1.2, cid_b);
     }
 }

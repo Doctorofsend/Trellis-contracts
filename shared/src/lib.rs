@@ -1,4 +1,4 @@
-#![no_std]
+#`!no_std]
 
 pub mod abuse;
 pub mod analytics;
@@ -132,6 +132,7 @@ pub use storage::{
     persistent_get, persistent_has, persistent_remove, persistent_set, set_paused, temporary_get,
     temporary_has, temporary_remove, temporary_set, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_TTL_THRESHOLD, TEMPORARY_BUMP_AMOUNT, TEMPORARY_TTL_THRESHOLD,
+    correlation_key,
 };
 pub use utils::{is_expired, now};
 pub use telemetry::{

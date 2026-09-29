@@ -9,6 +9,7 @@ use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Env,
 };
+
 #[allow(dead_code)]
 fn setup_token<'a>(
     env: &'a Env,

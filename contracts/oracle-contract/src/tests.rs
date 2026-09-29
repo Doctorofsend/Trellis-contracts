@@ -13,6 +13,7 @@ struct Fixture {
     contract_id: Address,
 }
 
+
 fn setup() -> Fixture {
     let env = Env::default();
     env.mock_all_auths();
@@ -33,6 +34,7 @@ fn setup() -> Fixture {
         contract_id,
     }
 }
+
 
 #[test]
 fn test_initialize_sets_admin() {
@@ -63,6 +65,18 @@ fn test_initialize_requires_the_admin_signature() {
     assert!(client.try_initialize(&admin).is_err());
 }
 
+
+#[test]
+fn test_initialize_requires_the_admin_signature() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, OracleContract);
+    let client = OracleContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    assert!(client.try_initialize(&admin).is_err());
+}
+
+
 #[test]
 fn test_get_admin() {
     let fx = setup();
@@ -77,6 +91,7 @@ fn test_register_submitter_success() {
     client.register_submitter(&fx.admin, &fx.submitter1);
     assert!(client.is_submitter_active(&fx.submitter1));
 }
+
 
 #[test]
 fn test_register_duplicate_submitter_fails() {
@@ -97,6 +112,7 @@ fn test_register_multiple_submitters() {
     assert!(client.is_submitter_active(&fx.submitter2));
 }
 
+
 #[test]
 fn test_deactivate_submitter_success() {
     let fx = setup();
@@ -106,6 +122,7 @@ fn test_deactivate_submitter_success() {
     client.deactivate_submitter(&fx.admin, &fx.submitter1);
     assert!(!client.is_submitter_active(&fx.submitter1));
 }
+
 
 #[test]
 fn test_deactivated_submitter_cannot_submit() {
@@ -126,6 +143,7 @@ fn test_deactivated_submitter_cannot_submit() {
     assert!(result.is_err());
 }
 
+
 #[test]
 fn test_submit_price_success() {
     let fx = setup();
@@ -143,6 +161,7 @@ fn test_submit_price_success() {
     );
     assert_eq!(id, 1);
 }
+
 
 #[test]
 fn test_submit_price_unauthorized_fails() {
@@ -162,6 +181,7 @@ fn test_submit_price_unauthorized_fails() {
     assert!(result.is_err());
 }
 
+
 #[test]
 fn test_submit_price_negative_price_fails() {
     let fx = setup();
@@ -179,6 +199,7 @@ fn test_submit_price_negative_price_fails() {
     );
     assert!(result.is_err());
 }
+
 
 #[test]
 fn test_submit_price_invalid_decimals_fails() {
@@ -198,6 +219,7 @@ fn test_submit_price_invalid_decimals_fails() {
     assert!(result.is_err());
 }
 
+
 #[test]
 fn test_submit_price_zero_price_success() {
     let fx = setup();
@@ -216,6 +238,7 @@ fn test_submit_price_zero_price_success() {
     assert!(result.is_ok());
 }
 
+
 #[test]
 fn test_submit_price_max_decimals_success() {
     let fx = setup();
@@ -233,6 +256,7 @@ fn test_submit_price_max_decimals_success() {
     );
     assert!(result.is_ok());
 }
+
 
 #[test]
 fn test_replay_protection_duplicate_nonce() {
@@ -263,6 +287,7 @@ fn test_replay_protection_duplicate_nonce() {
     );
     assert!(result2.is_err());
 }
+
 
 #[test]
 fn test_sequential_nonces_success() {
@@ -304,6 +329,7 @@ fn test_sequential_nonces_success() {
     assert!(r3.is_ok());
 }
 
+
 #[test]
 fn test_nonce_skipping_fails() {
     let fx = setup();
@@ -322,6 +348,7 @@ fn test_nonce_skipping_fails() {
     assert!(result.is_err());
 }
 
+
 #[test]
 fn test_independent_feed_nonces() {
     let fx = setup();
@@ -338,6 +365,7 @@ fn test_independent_feed_nonces() {
     let r2 = client.try_submit_price(&fx.submitter1, &eth, &3000_00000000i128, &8u32, &ts, &1u64);
     assert!(r2.is_ok());
 }
+
 
 #[test]
 fn test_stale_submission_rejected() {
@@ -361,6 +389,7 @@ fn test_stale_submission_rejected() {
     assert!(result.is_err());
 }
 
+
 #[test]
 fn test_fresh_submission_within_window() {
     let fx = setup();
@@ -382,6 +411,7 @@ fn test_fresh_submission_within_window() {
     );
     assert!(result.is_ok());
 }
+
 
 #[test]
 fn test_submission_at_boundary() {
@@ -405,6 +435,7 @@ fn test_submission_at_boundary() {
     assert!(result.is_ok());
 }
 
+
 #[test]
 fn test_get_latest_price_after_submit() {
     let fx = setup();
@@ -426,6 +457,7 @@ fn test_get_latest_price_after_submit() {
     assert_eq!(latest.submission_count, 1);
 }
 
+
 #[test]
 fn test_get_latest_price_never_written_fails() {
     let fx = setup();
@@ -433,6 +465,7 @@ fn test_get_latest_price_never_written_fails() {
     let result = client.try_get_latest_price(&symbol_short!("XYZUSD"));
     assert!(result.is_err());
 }
+
 
 #[test]
 fn test_get_latest_price_most_recent() {
@@ -468,6 +501,7 @@ fn test_get_latest_price_most_recent() {
     assert_eq!(l2.submission_count, 2);
 }
 
+
 #[test]
 fn test_get_price_history_empty_feed_fails() {
     let fx = setup();
@@ -475,6 +509,7 @@ fn test_get_price_history_empty_feed_fails() {
     let result = client.try_get_price_history(&symbol_short!("XYZUSD"), &10u32);
     assert!(result.is_err());
 }
+
 
 #[test]
 fn test_get_price_history_returns_submissions() {
@@ -493,6 +528,7 @@ fn test_get_price_history_returns_submissions() {
     let history = client.get_price_history(&feed_id, &10u32);
     assert_eq!(history.len(), 5);
 }
+
 
 #[test]
 fn test_get_price_history_respects_limit() {
@@ -514,6 +550,7 @@ fn test_get_price_history_respects_limit() {
     assert_eq!(history.get(1).unwrap().id, 9);
     assert_eq!(history.get(2).unwrap().id, 10);
 }
+
 
 #[test]
 fn test_multiple_submitters_same_feed() {
@@ -546,6 +583,49 @@ fn test_multiple_submitters_same_feed() {
     assert_eq!(latest.price, 50500_00000000i128);
     assert_eq!(latest.submission_count, 2);
 }
+
+
+#[test]
+fn test_future_timestamp_rejected() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.register_submitter(&fx.admin, &fx.submitter1);
+
+    let feed_id = symbol_short!("BTCUSD");
+    let future_ts = fx.env.ledger().timestamp() + 61;
+
+    let result = client.try_submit_price(
+        &fx.submitter1,
+        &feed_id,
+        &50000_00000000i128,
+        &8u32,
+        &future_ts,
+        &1u64,
+    );
+    assert_eq!(result, Err(Ok(OracleError::SubmissionFromFuture)));
+}
+
+
+#[test]
+fn test_median_ignores_single_outlier() {
+    let fx = setup();
+    let submitter3 = Address::generate(&fx.env);
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.register_submitter(&fx.admin, &fx.submitter1);
+    client.register_submitter(&fx.admin, &fx.submitter2);
+    client.register_submitter(&fx.admin, &submitter3);
+
+    let feed_id = symbol_short!("BTCUSD");
+    let ts = fx.env.ledger().timestamp();
+    client.submit_price(&fx.submitter1, &feed_id, &50_000_i128, &2u32, &ts, &1u64);
+    client.submit_price(&fx.submitter2, &feed_id, &51_000_i128, &2u32, &ts, &1u64);
+    client.submit_price(&submitter3, &feed_id, &1_000_000_i128, &2u32, &ts, &1u64);
+
+    let latest = client.get_latest_price(&feed_id);
+    assert_eq!(latest.price, 51_000_i128);
+    assert_eq!(latest.submission_count, 3);
+}
+
 
 #[test]
 fn test_future_timestamp_rejected() {
@@ -596,12 +676,14 @@ fn test_set_staleness_window_success() {
     assert_eq!(client.get_staleness_window(), 7200);
 }
 
+
 #[test]
 fn test_get_staleness_window_default() {
     let fx = setup();
     let client = OracleContractClient::new(&fx.env, &fx.contract_id);
     assert_eq!(client.get_staleness_window(), 3600);
 }
+
 
 #[test]
 fn test_set_staleness_window_zero() {
@@ -625,6 +707,7 @@ fn test_set_staleness_window_zero() {
     assert!(result.is_err());
 }
 
+
 #[test]
 fn test_is_submitter_active_status() {
     let fx = setup();
@@ -636,3 +719,4 @@ fn test_is_submitter_active_status() {
     client.deactivate_submitter(&fx.admin, &fx.submitter1);
     assert!(!client.is_submitter_active(&fx.submitter1));
 }
+
