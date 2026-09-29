@@ -46,6 +46,22 @@ provides the maintainer-only query. New sensitive mutation paths should write
 only after authorization and validation succeed, and should add tests for actor
 attribution, event shape, and maintainer-only access.
 
+## Related: invariants and threat model
+
+The maintainer audit trail on this page records *that* a sensitive mutation
+happened and who did it. It does not state what protocol-level guarantee that
+mutation is supposed to preserve, or what an adversary could still attempt
+around it — those are covered separately:
+
+- [`SECURITY_INVARIANTS.md`](./SECURITY_INVARIANTS.md): the formal invariants
+  (token conservation across Treasury/Aid, referral graph acyclicity and
+  reward non-dilution, oracle staleness/quorum bounds, access-control's
+  admin non-revocability), each tied to the function and error variant that
+  enforces it.
+- [`THREAT_MODEL.md`](./THREAT_MODEL.md): trust assumptions for admin keys
+  and oracle submitters, attack vectors per contract family, and which pause
+  mechanism applies where.
+
 ## Validation
 
 ```bash

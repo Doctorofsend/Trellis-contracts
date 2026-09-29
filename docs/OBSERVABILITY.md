@@ -201,3 +201,106 @@ Contract test suites use the snapshot helpers documented in
 deterministic before/after state and assert expected deltas for balances,
 ownership, status, and metadata. Unexpected deltas fail tests with a
 structured diff of the observed changes.
+
+## Automated budget profiling
+
+Telemetry and snapshots tell you *what* happened to a call. This section is
+about *what it cost*: the Soroban host's CPU-instruction and memory-byte
+meters, which are the same quantities the network charges for at runtime.
+CI profiles these on every pull request so a change that quietly makes a
+critical path more expensive is caught before merge, not after a mainnet
+budget-exceeded failure.
+
+### What is profiled
+
+The `profile-budget` CI job (`.github/workflows/ci.yml`) measures one
+representative call per contract via `Env::budget()`, the same host API
+`contracts/treasury-contract/src/budget_test.rs` uses for its per-PR
+regression assertions (issue #158):
+
+| Contract | Call | Harness |
+| --- | --- | --- |
+| `aid-contract` | `create_aid` | `contracts/aid-contract/src/profile_budget.rs` |
+| `aid-contract` | `claim_aid` | `contracts/aid-contract/src/profile_budget.rs` |
+| `treasury-contract` | `withdraw` | `contracts/treasury-contract/src/profile_budget.rs` |
+| `referral-contract` | `register` | `contracts/referral-contract/src/profile_budget.rs` |
+| `rebalancer-contract` | `rebalance` | `contracts/rebalancer-contract/src/profile_budget.rs` |
+
+Each harness resets the budget, calls the contract once through a realistic
+fixture, and prints the delta as a machine-readable line:
+
+```text
+BUDGET_METRIC aid.create_aid cpu=123456 mem=7890
+```
+
+`scripts/profile-budget.sh` runs `cargo test -p <contract> --lib
+profile_budget -- --nocapture` for each contract above, collects those
+lines, and hands them to `scripts/compare-budget.cjs`.
+
+This is a deliberately different mechanism from `budget_test.rs`'s
+`assert_within`: that suite pins hard-coded, per-contract limits inside the
+crate and asks "did this change make the call meaningfully worse than the
+commit that set the constant." The CI job here asks a cheaper, more general
+question -- "compared to the last-recorded baseline, by how much, right
+now" -- for every profiled contract from one place, without needing a new
+hard-coded constant per call.
+
+### Baseline and threshold
+
+Measured costs are compared against the checked-in baseline at
+`testing/budget-baseline.json` (`{ "metrics": { "<contract>.<call>": {
+"cpu_instructions": N, "memory_bytes": M }, ... } }`). A call fails the job
+when either its CPU instructions or its memory bytes increase by more than
+**10%** relative to the baseline. That threshold is deliberately loose, for
+the same reason `budget_test.rs`'s `HEADROOM_PERCENT` is: a `soroban-sdk`
+patch bump can shift the host's cost model by a few percent, and that alone
+should not fail an unrelated PR. A real regression is typically measured in
+multiples, not single-digit percentages.
+
+The threshold is tunable without editing the workflow: set the repository
+variable `BUDGET_REGRESSION_THRESHOLD_PERCENT` (Settings → Secrets and
+variables → Actions → Variables), or pass `--threshold <percent>` when
+running `scripts/profile-budget.sh` locally. It defaults to `10`.
+
+### Updating the baseline
+
+When a measured increase is intentional (a new guard, a richer event
+payload, an added storage read), regenerate the baseline and explain why in
+the PR:
+
+```bash
+./scripts/profile-budget.sh --update-baseline
+git add testing/budget-baseline.json
+```
+
+### Reading the job output
+
+`profile-budget` writes a markdown comparison table to the job's
+`$GITHUB_STEP_SUMMARY` (visible on the job's summary page, no PR comment
+needed) with one row per profiled call:
+
+- **PASS** — within the threshold.
+- **FAIL** — CPU or memory regressed beyond the threshold; the job exits
+  non-zero.
+- **NEW** — measured this run but absent from the baseline (a call profiled
+  for the first time); does not fail the job.
+- **MISSING** — present in the baseline but not measured this run, because
+  that contract's `profile_budget` tests did not build or run. This is
+  reported as a warning, not a job failure, so an unrelated, pre-existing
+  problem in one contract's test suite cannot silently block every other
+  contract's profiling.
+
+### Running it locally
+
+```bash
+./scripts/profile-budget.sh                        # measure and compare
+./scripts/profile-budget.sh --threshold 25          # loosen the gate for one run
+./scripts/profile-budget.sh --update-baseline       # regenerate the baseline file
+```
+
+Or, to inspect a single contract's raw measurement without the comparison
+step:
+
+```bash
+cargo test -p aid-contract --lib profile_budget -- --nocapture --test-threads=1
+```

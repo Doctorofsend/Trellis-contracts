@@ -9,3 +9,13 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 shared = { path = "../shared" }
+
+[dev-dependencies]
+# Real contract crates used by the cross-contract state fuzzing harness
+# (Issue #191) so it exercises the actual aid/treasury/referral logic
+# instead of hand-rolled mocks. Only needed for `cargo test`, hence
+# dev-dependencies; see the `rlib` addition to their own [lib] sections.
+aid-contract = { path = "../contracts/aid-contract" }
+treasury-contract = { path = "../contracts/treasury-contract" }
+referral-contract = { path = "../contracts/referral-contract" }
+proptest = "1.4"

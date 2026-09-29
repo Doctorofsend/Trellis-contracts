@@ -59,6 +59,8 @@
 | [docs/PROGRESSIVE_DISCLOSURE.md](docs/PROGRESSIVE_DISCLOSURE.md) | Advanced transaction detail fields, and why critical warnings can't end up advanced-only |
 | [docs/CHANGELOG_SCHEMA.md](docs/CHANGELOG_SCHEMA.md) | The machine-readable changelog (`changelog/entries.json`): schema, validation, when an entry is required |
 | [docs/RELEASE_READINESS.md](docs/RELEASE_READINESS.md) | The PR checklist, what's automated vs. reviewer judgment, and the emergency-fix exception process |
+| [docs/SECURITY_INVARIANTS.md](docs/SECURITY_INVARIANTS.md) | Formal protocol invariants (token conservation, referral acyclicity, oracle quorum/staleness, admin non-revocability) with the code and error variant that enforces each one |
+| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | Trust assumptions, adversarial attack vectors per contract family, and pause/emergency-response pointers |
 - Storage Layout
 - Documentation
 - Contribution Guide
