@@ -77,6 +77,14 @@ To prevent breaking schema changes from deploying incompatible WASM code and cor
 3. **Execution Guard in `execute_upgrade`**:
    Before bytecode is swapped, `validate_storage` runs again to ensure state consistency has not drifted since proposal time.
 
+## Storage Schema Version Guards (Issue #140)
+
+To prevent incompatible bytecode interpretations across contract upgrades, every contract stamps its active storage schema version in instance storage (`stor_ver`). Read operations are protected with deterministic guards:
+- Active schema version reads succeed.
+- Old-compatible versions (e.g. V1) remain decodable and can be upgraded monotonically.
+- Incompatible or missing schema versions fail fast with `Error::UnsupportedSchemaVersion`.
+See [`docs/STORAGE_SCHEMA_GUARDS.md`](./STORAGE_SCHEMA_GUARDS.md) for full architecture and runbook details.
+
 ## Running a migration
 
 ```rust

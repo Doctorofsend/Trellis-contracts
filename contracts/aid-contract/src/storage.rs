@@ -55,6 +55,10 @@ pub enum DataKey {
     /// Admin-controlled discovery visibility flag. Missing means visible for
     /// backwards-compatible records.
     SearchHidden(u64),
+    /// Correlation ID attached at creation (persistent).
+    CorrelationId(u64),
+    /// Contract storage schema version (instance).
+    StorageSchemaVersion,
 }
 
 // ---------------------------------------------------------------------------
@@ -243,4 +247,23 @@ pub fn is_initialized(env: &Env) -> bool {
 /// Mark the contract as initialized.
 pub fn set_initialized(env: &Env) {
     instance_set(env, &DataKey::Initialized, &true);
+}
+
+// ---------------------------------------------------------------------------
+// Storage schema version — instance storage (Issue #140)
+// ---------------------------------------------------------------------------
+
+/// Read the contract storage schema version.
+pub fn get_storage_schema_version(env: &Env) -> Option<u32> {
+    shared::storage_version::get_storage_schema_version(env)
+}
+
+/// Store the explicit contract storage schema version.
+pub fn set_storage_schema_version(env: &Env, version: u32) {
+    shared::storage_version::set_storage_schema_version(env, version);
+}
+
+/// Verify that the storage schema version is currently supported for read paths.
+pub fn guard_storage_read(env: &Env) -> Result<u32, shared::Error> {
+    shared::storage_version::guard_storage_read(env)
 }

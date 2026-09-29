@@ -410,7 +410,7 @@ pub fn group_by_operation_type(env: &Env, failures: &Vec<PartialFailure>) -> Vec
         }
 
         if count > 0 {
-            let type_symbol = operation_type_to_symbol(op_type);
+            let type_symbol = operation_type_to_symbol(env, op_type);
             groups.push_back(FailureGroup {
                 dimension: Symbol::new(env, "operation_type"),
                 value: type_symbol,
@@ -577,7 +577,7 @@ pub fn group_by_retryability(env: &Env, failures: &Vec<PartialFailure>) -> Vec<F
 }
 
 /// Helper function to convert OperationType to Symbol.
-fn operation_type_to_symbol(op_type: &OperationType) -> Symbol {
+fn operation_type_to_symbol(env: &Env, op_type: &OperationType) -> Symbol {
     match op_type {
         OperationType::Payment => symbol_short!("payment"),
         OperationType::Transfer => symbol_short!("transfer"),

@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Symbol};
 
 // Legacy single-topic constants retained for backward compatibility.
 pub const AID_CREATED: Symbol = symbol_short!("aid_crt");
@@ -1182,17 +1182,15 @@ mod tests {
     #[test]
     fn validate_correlation_id_accepts_max_length() {
         let env = Env::default();
-        let s: String = core::iter::repeat('a')
-            .take(CORRELATION_ID_MAX_LEN as usize)
-            .collect();
-        let id = cid(&env, &s);
+        let buf = [b'a'; 32];
+        let id = BytesN::from_array(&env, &buf);
         assert_eq!(validate_correlation_id(&id), Ok(()));
     }
 
     #[test]
     fn normalize_correlation_id_rejects_invalid() {
         let env = Env::default();
-        let id = cid(&env, "bad id!");
+        let id = cid(&env, "bad-id-with-space !");
         assert_eq!(
             normalize_correlation_id(&id),
             Err(CorrelationIdError::InvalidCharacter)
@@ -1233,8 +1231,8 @@ mod tests {
 
         for i in 0..events.len() {
             let (_emitter, topics, _data) = events.get(i).unwrap();
-            let decoded: (Symbol, Symbol, BytesN<32>) = FromVal::from_val(&env, &topics);
-            assert_eq!(decoded.2, correlation_id);
+            let actual_cid: BytesN<32> = FromVal::from_val(&env, &topics.get(2).unwrap());
+            assert_eq!(actual_cid, correlation_id);
         }
     }
 
@@ -1260,8 +1258,8 @@ mod tests {
         let events = env.events().all();
         assert_eq!(events.len(), 1);
         let (_emitter, topics, _data) = events.get(0).unwrap();
-        let decoded: (Symbol, Symbol, BytesN<32>) = FromVal::from_val(&env, &topics);
-        assert_eq!(decoded.2, correlation_id);
+        let actual_cid: BytesN<32> = FromVal::from_val(&env, &topics.get(2).unwrap());
+        assert_eq!(actual_cid, correlation_id);
     }
 
     #[test]
@@ -1281,10 +1279,10 @@ mod tests {
         assert_eq!(events.len(), 2);
         let (_e0, t0, _d0) = events.get(0).unwrap();
         let (_e1, t1, _d1) = events.get(1).unwrap();
-        let d0: (Symbol, Symbol, BytesN<32>) = FromVal::from_val(&env, &t0);
-        let d1: (Symbol, Symbol, BytesN<32>) = FromVal::from_val(&env, &t1);
-        assert_ne!(d0.2, d1.2);
-        assert_eq!(d0.2, cid_a);
-        assert_eq!(d1.2, cid_b);
+        let d0: BytesN<32> = FromVal::from_val(&env, &t0.get(2).unwrap());
+        let d1: BytesN<32> = FromVal::from_val(&env, &t1.get(2).unwrap());
+        assert_ne!(d0, d1);
+        assert_eq!(d0, cid_a);
+        assert_eq!(d1, cid_b);
     }
 }

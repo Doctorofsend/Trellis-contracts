@@ -124,6 +124,8 @@ pub enum TimelineEventType {
     ScheduledActionEarly,
     /// A scheduled action was rejected because its time window had expired.
     ScheduledActionLate,
+    /// An action was rejected.
+    ActionRejected,
 }
 
 /// A stable pointer at the resource an entry describes.

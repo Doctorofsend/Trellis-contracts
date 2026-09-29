@@ -37,20 +37,20 @@
 use shared::events::{
     emit_action_executed, emit_aid_created, emit_module_initialized, emit_permission_changed,
 };
-use shared::storage::{is_paused, persistent_get, persistent_set, set_paused as shared_set_paused};
+use shared::storage::{is_paused, set_paused as shared_set_paused};
 use shared::{
     emit, record_action_audit_event, Error, ResourceLink, TimelineEventType, AID_CLAIMED,
     AID_CREATED, AID_REFUNDED, AID_SETTLED,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, panic_with_error, symbol_short, token, Address, Bytes,
-    Env, Map, Symbol, Vec,
+    Env, Symbol, Vec,
 };
 
 pub mod api;
+pub mod correlation;
 pub mod storage;
 pub mod types;
-pub mod correlation;
 
 use storage::{get_aid, get_aid_counter, has_aid, set_aid, set_aid_counter};
 
@@ -79,6 +79,12 @@ pub enum AidError {
     CannotDeletePending = 107,
     /// The supplied correlation ID is malformed or violates policy.
     InvalidCorrelationId = 108,
+    /// The contract storage uses a schema version this contract does not support.
+    UnsupportedSchemaVersion = 109,
+    /// A schema migration was attempted but failed validation.
+    SchemaMigrationFailed = 110,
+    /// A supplied argument is structurally invalid.
+    InvalidArgument = 111,
 }
 
 #[contract]
@@ -120,9 +126,14 @@ impl AidContract {
         storage::set_token(&env, &token);
         storage::set_default_expiry(&env, default_expiry_secs);
         storage::set_initialized(&env);
+        storage::set_storage_schema_version(
+            &env,
+            shared::storage_version::CURRENT_STORAGE_SCHEMA_VERSION,
+        );
 
         emit_module_initialized(
             &env,
+            &correlation::zero_correlation_id(&env),
             symbol_short!("aid"),
             1,
             &admin,
@@ -268,13 +279,13 @@ impl AidContract {
 
         emit_aid_created(
             &env,
+            &correlation::zero_correlation_id(&env),
             aid_id,
             &donor,
             &recipient,
             amount,
             env.ledger().sequence().into(),
             expiry_ledger.into(),
-            correlation_id.clone(),
         );
 
         emit(
@@ -291,6 +302,7 @@ impl AidContract {
         );
         emit_action_executed(
             &env,
+            &correlation::zero_correlation_id(&env),
             symbol_short!("aid"),
             symbol_short!("create"),
             &env.current_contract_address(),
@@ -351,6 +363,7 @@ impl AidContract {
         emit(&env, AID_SETTLED, (aid_id, correlation_id.clone()));
         emit_action_executed(
             &env,
+            &correlation::zero_correlation_id(&env),
             symbol_short!("aid"),
             symbol_short!("claim_aid"),
             &env.current_contract_address(),
@@ -375,6 +388,7 @@ impl AidContract {
     /// - [`AidError::NotExpiredYet`]  — expiry has not yet passed.
     pub fn refund_aid(env: Env, aid_id: u64, caller: Address) -> Result<(), AidError> {
         let mut record = get_aid(&env, aid_id).ok_or(AidError::NotFound)?;
+        let correlation_id = correlation::load(&env, aid_id);
         caller.require_auth();
 
         let admin = shared::auth::get_admin(&env);
@@ -406,6 +420,7 @@ impl AidContract {
         emit(&env, AID_REFUNDED, (aid_id, correlation_id.clone()));
         emit_action_executed(
             &env,
+            &correlation::zero_correlation_id(&env),
             symbol_short!("aid"),
             symbol_short!("refund"),
             &env.current_contract_address(),
@@ -605,6 +620,60 @@ impl AidContract {
     }
 
     // -----------------------------------------------------------------------
+    // Storage schema version & deterministic guards (Issue #140)
+    // -----------------------------------------------------------------------
+
+    /// Read the contract storage schema version.
+    pub fn get_storage_schema_version(env: Env) -> u32 {
+        storage::get_storage_schema_version(&env)
+            .unwrap_or(shared::storage_version::STORAGE_SCHEMA_V1)
+    }
+
+    /// Explicitly validate contract storage schema version against supported bounds.
+    ///
+    /// # Errors
+    /// * [`AidError::UnsupportedSchemaVersion`] - If stored schema version is unsupported.
+    pub fn validate_storage_schema(env: Env) -> Result<u32, AidError> {
+        storage::guard_storage_read(&env).map_err(|e| match e {
+            shared::Error::UnsupportedSchemaVersion => AidError::UnsupportedSchemaVersion,
+            shared::Error::NotFound => AidError::NotFound,
+            _ => AidError::UnsupportedSchemaVersion,
+        })
+    }
+
+    /// Version-guarded read: returns the latest [`shared::compat::CurrentAidRecord`]
+    /// after verifying that the contract storage schema version is compatible.
+    ///
+    /// # Errors
+    /// * [`AidError::UnsupportedSchemaVersion`] - If contract storage version is incompatible.
+    pub fn get_aid_guarded(
+        env: Env,
+        aid_id: u64,
+    ) -> Result<Option<shared::compat::CurrentAidRecord>, AidError> {
+        Self::validate_storage_schema(env.clone())?;
+        Ok(Self::get_aid_latest(env, aid_id))
+    }
+
+    /// Admin function to upgrade the contract storage schema version.
+    ///
+    /// # Errors
+    /// * [`AidError::Unauthorized`] - If caller is not admin.
+    /// * [`AidError::UnsupportedSchemaVersion`] - If new_version is outside supported range.
+    /// * [`AidError::InvalidArgument`] - If new_version <= current version.
+    pub fn upgrade_storage_schema(
+        env: Env,
+        caller: Address,
+        new_version: u32,
+    ) -> Result<u32, AidError> {
+        shared::auth::require_admin(&env, &caller).map_err(|_| AidError::Unauthorized)?;
+        shared::storage_version::upgrade_storage_schema(&env, new_version).map_err(|e| match e {
+            shared::Error::UnsupportedSchemaVersion => AidError::UnsupportedSchemaVersion,
+            shared::Error::InvalidArgument => AidError::InvalidArgument,
+            _ => AidError::UnsupportedSchemaVersion,
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // Admin controls
     // -----------------------------------------------------------------------
 
@@ -644,6 +713,7 @@ impl AidContract {
         )?;
         emit_permission_changed(
             &env,
+            &correlation::zero_correlation_id(&env),
             symbol_short!("aid"),
             symbol_short!("pauser"),
             &pauser,
@@ -666,6 +736,7 @@ impl AidContract {
             .set(&Symbol::new(&env, "paused"), &paused);
         emit_permission_changed(
             &env,
+            &correlation::zero_correlation_id(&env),
             symbol_short!("aid"),
             symbol_short!("paused"),
             &admin,
