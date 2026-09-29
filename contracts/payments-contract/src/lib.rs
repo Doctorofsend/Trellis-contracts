@@ -15,6 +15,7 @@
 
 #![no_std]
 
+use soroban_sdk::BytesN;
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
 
 use shared::auth;
@@ -54,6 +55,10 @@ pub struct PaymentConfig {
 // Contract
 // ===========================================================================
 
+fn zero_correlation_id(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0; 32])
+}
+
 #[contract]
 pub struct ExamplePaymentsContract;
 
@@ -86,6 +91,7 @@ impl ExamplePaymentsContract {
 
         shared::events::emit_module_initialized(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("pay_gw"),
             1,
             &admin,
@@ -109,6 +115,7 @@ impl ExamplePaymentsContract {
 
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("pay_gw"),
             symbol_short!("fee_set"),
             &caller,

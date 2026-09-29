@@ -1,7 +1,7 @@
 //! Testing & Simulation Module for Soroban contracts
-///
-/// Provides comprehensive test harnesses, mocks, fuzzing helpers, and simulation tools
-/// for all contracts in the trellis-contracts repository.
+//!
+//! Provides comprehensive test harnesses, mocks, fuzzing helpers, and simulation tools
+//! for all contracts in the trellis-contracts repository.
 
 #![no_std]
 

@@ -410,9 +410,9 @@ pub fn group_by_operation_type(
         }
 
         if count > 0 {
-            let type_symbol = operation_type_to_symbol(op_type);
+            let type_symbol = operation_type_to_symbol(env, op_type);
             groups.push_back(FailureGroup {
-                dimension: symbol_short!("operation_type"),
+                dimension: Symbol::new(env, "operation_type"),
                 value: type_symbol,
                 count,
                 critical_count,
@@ -553,7 +553,7 @@ pub fn group_by_retryability(env: &Env, failures: &Vec<PartialFailure>) -> Vec<F
 
     if retryable_count > 0 {
         groups.push_back(FailureGroup {
-            dimension: symbol_short!("retryability"),
+            dimension: Symbol::new(env, "retryability"),
             value: symbol_short!("retryable"),
             count: retryable_count,
             critical_count: retryable_critical,
@@ -564,8 +564,8 @@ pub fn group_by_retryability(env: &Env, failures: &Vec<PartialFailure>) -> Vec<F
 
     if non_retryable_count > 0 {
         groups.push_back(FailureGroup {
-            dimension: symbol_short!("retryability"),
-            value: symbol_short!("non_retryable"),
+            dimension: Symbol::new(env, "retryability"),
+            value: Symbol::new(env, "non_retryable"),
             count: non_retryable_count,
             critical_count: non_retryable_critical,
             retryable_count: 0,
@@ -577,14 +577,14 @@ pub fn group_by_retryability(env: &Env, failures: &Vec<PartialFailure>) -> Vec<F
 }
 
 /// Helper function to convert OperationType to Symbol.
-fn operation_type_to_symbol(op_type: &OperationType) -> Symbol {
+fn operation_type_to_symbol(env: &Env, op_type: &OperationType) -> Symbol {
     match op_type {
         OperationType::Payment => symbol_short!("payment"),
         OperationType::Transfer => symbol_short!("transfer"),
         OperationType::Worker => symbol_short!("worker"),
         OperationType::Webhook => symbol_short!("webhook"),
-        OperationType::ExternalApi => symbol_short!("external_api"),
-        OperationType::DatabaseSync => symbol_short!("database_sync"),
+        OperationType::ExternalApi => Symbol::new(env, "ext_api"),
+        OperationType::DatabaseSync => Symbol::new(env, "db_sync"),
         OperationType::Contract => symbol_short!("contract"),
     }
 }
@@ -619,7 +619,7 @@ pub fn generate_enhanced_dashboard(
     let mut redacted_partial_failures = Vec::new(env);
     for failure in partial_failures.iter() {
         if failure.state != FailureState::Resolved {
-            redacted_partial_failures.push_back(redact_partial_failure(env, failure));
+            redacted_partial_failures.push_back(redact_partial_failure(env, &failure));
         }
     }
 

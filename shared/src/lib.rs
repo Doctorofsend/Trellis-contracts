@@ -1,4 +1,4 @@
-#`!no_std]
+#![no_std]
 
 pub mod abuse;
 pub mod analytics;
@@ -39,8 +39,10 @@ pub mod retention;
 pub mod sanitize;
 pub mod semantic;
 pub mod storage;
+pub mod storage_version;
 pub mod telemetry;
 pub mod timeline;
+pub mod time_window;
 pub mod utils;
 pub mod webhook;
 pub mod dashboard;
@@ -136,7 +138,14 @@ pub use storage::{
     persistent_get, persistent_has, persistent_remove, persistent_set, set_paused, temporary_get,
     temporary_has, temporary_remove, temporary_set, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_TTL_THRESHOLD, TEMPORARY_BUMP_AMOUNT, TEMPORARY_TTL_THRESHOLD,
-    correlation_key,
+};
+pub use storage_version::{
+    ensure_storage_schema_version, get_storage_schema_version, guard_storage_read,
+    has_storage_schema_version, is_legacy_storage_schema, is_supported_storage_schema,
+    remove_storage_schema_version, set_storage_schema_version, upgrade_storage_schema,
+    validate_storage_schema_read, CURRENT_STORAGE_SCHEMA_VERSION, KEY_STORAGE_SCHEMA_VERSION,
+    MAX_SUPPORTED_STORAGE_SCHEMA_VERSION, MIN_SUPPORTED_STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_V1,
+    STORAGE_SCHEMA_V2, TOPIC_SCHEMA_CHECK, TOPIC_SCHEMA_UPGRADE,
 };
 pub use utils::{is_expired, now};
 pub use telemetry::{

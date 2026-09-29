@@ -140,4 +140,8 @@ pub enum Error {
     AidNotExpiredYet = 951,
     /// Aid already refunded.
     AidAlreadyRefunded = 952,
+    /// A scheduled action was attempted before its valid time window opened.
+    ActionTooEarly = 953,
+    /// A scheduled action was attempted after its valid time window closed.
+    ActionExpired = 954,
 }

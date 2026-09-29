@@ -4,11 +4,11 @@ extern crate std;
 
 use super::*;
 use shared::Error as SharedError;
-use std::collections::BTreeMap;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Env,
 };
+use std::collections::BTreeMap;
 
 #[allow(dead_code)]
 fn setup_token<'a>(
@@ -71,7 +71,7 @@ fn create_aids(
     let expiry = env.ledger().sequence() + 10_000;
     let mut ids = std::vec::Vec::with_capacity(count as usize);
     for _ in 0..count {
-        ids.push(client.create_aid(donor, recipient, &100, &expiry));
+        ids.push(client.create_aid(donor, recipient, &100, &expiry, &None));
     }
     ids
 }
@@ -124,10 +124,7 @@ impl ContractSnapshot {
 
         let mut balances = BTreeMap::new();
         for addr in [&fx.admin, &fx.donor, &fx.recipient, &fx.contract_id] {
-            balances.insert(
-                std::format!("{:?}", addr),
-                token_client.balance(addr),
-            );
+            balances.insert(std::format!("{:?}", addr), token_client.balance(addr));
         }
 
         let mut aids = BTreeMap::new();
@@ -165,7 +162,7 @@ impl ContractSnapshot {
         }
     }
 
-    fn expect_delta(&self, after: &ContractSnapshot) -> DeltaExpectation<'_> {
+    fn expect_delta<'a>(&'a self, after: &'a ContractSnapshot) -> DeltaExpectation<'a> {
         DeltaExpectation {
             before: self,
             after,
@@ -182,7 +179,7 @@ struct DeltaExpectation<'a> {
     before: &'a ContractSnapshot,
     after: &'a ContractSnapshot,
     expected_balances: BTreeMap<std::string::String, i128>,
-    expected_statuses: BTreeMap<u64, AidStatus>,
+    expected_statuses: BTreeMap<u64, Option<AidStatus>>,
     expected_search_index: Option<std::vec::Vec<u64>>,
     expected_paused: Option<bool>,
 }
@@ -195,7 +192,12 @@ impl<'a> DeltaExpectation<'a> {
     }
 
     fn aid_status(mut self, aid_id: u64, status: AidStatus) -> Self {
-        self.expected_statuses.insert(aid_id, status);
+        self.expected_statuses.insert(aid_id, Some(status));
+        self
+    }
+
+    fn aid_deleted(mut self, aid_id: u64) -> Self {
+        self.expected_statuses.insert(aid_id, None);
         self
     }
 
@@ -234,15 +236,16 @@ impl<'a> DeltaExpectation<'a> {
         }
 
         // --- Aid statuses -------------------------------------------------
-        let mut all_ids: std::collections::BTreeSet<u64> = self.before.aids.keys().copied().collect();
+        let mut all_ids: std::collections::BTreeSet<u64> =
+            self.before.aids.keys().copied().collect();
         all_ids.extend(self.after.aids.keys().copied());
         for id in all_ids {
             let before_status = self.before.aids.get(&id).map(|r| r.status.clone());
             let after_status = self.after.aids.get(&id).map(|r| r.status.clone());
-            let expected = self.expected_statuses.get(&id).cloned();
+            let expected = self.expected_statuses.get(&id);
             match expected {
                 Some(exp) => {
-                    if after_status.as_ref() != Some(&exp) {
+                    if after_status.as_ref() != exp.as_ref() {
                         failures.push(std::format!(
                             "aid {} status: expected {:?}, got {:?} (before={:?})",
                             id,
@@ -331,7 +334,7 @@ fn claim_transfers_escrow_and_settles() {
     let token_client = token::Client::new(&fx.env, &fx.token_addr);
 
     let expiry = fx.env.ledger().sequence() + 100;
-    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &None);
     assert_eq!(token_client.balance(&fx.contract_id), 500);
 
     let before = ContractSnapshot::capture(&fx);
@@ -349,6 +352,7 @@ fn claim_transfers_escrow_and_settles() {
         .balance(&fx.contract_id, -500)
         .balance(&fx.recipient, 500)
         .aid_status(aid_id, AidStatus::Settled)
+        .search_index(std::vec::Vec::new())
         .assert();
 }
 
@@ -358,7 +362,7 @@ fn second_claim_returns_already_claimed() {
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
 
     let expiry = fx.env.ledger().sequence() + 100;
-    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &None);
     client.claim_aid(&aid_id, &fx.recipient);
 
     let result = client.try_claim_aid(&aid_id, &fx.recipient);
@@ -371,7 +375,7 @@ fn claim_after_expiry_is_rejected() {
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
 
     let expiry = fx.env.ledger().sequence() + 100;
-    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &None);
 
     advance_ledger(&fx.env, 101);
 
@@ -389,7 +393,7 @@ fn claim_by_wrong_address_is_unauthorized() {
     let stranger = Address::generate(&fx.env);
 
     let expiry = fx.env.ledger().sequence() + 100;
-    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &None);
 
     let before = ContractSnapshot::capture(&fx);
     let result = client.try_claim_aid(&aid_id, &stranger);
@@ -404,7 +408,7 @@ fn claim_while_paused_is_rejected() {
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
 
     let expiry = fx.env.ledger().sequence() + 100;
-    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &None);
     client.set_paused(&fx.admin, &true);
 
     let before = ContractSnapshot::capture(&fx);
@@ -447,7 +451,7 @@ fn create_aid_rejects_non_positive_amount_and_past_expiry() {
 
     let expiry = fx.env.ledger().sequence() + 100;
     assert_eq!(
-        client.try_create_aid(&fx.donor, &fx.recipient, &0, &expiry),
+        client.try_create_aid(&fx.donor, &fx.recipient, &0, &expiry, &None),
         Err(Ok(soroban_sdk::Error::from_contract_error(
             SharedError::InvalidAmount as u32
         )))
@@ -455,7 +459,7 @@ fn create_aid_rejects_non_positive_amount_and_past_expiry() {
 
     let past = fx.env.ledger().sequence();
     assert_eq!(
-        client.try_create_aid(&fx.donor, &fx.recipient, &100, &past),
+        client.try_create_aid(&fx.donor, &fx.recipient, &100, &past, &None),
         Err(Ok(soroban_sdk::Error::from_contract_error(
             SharedError::InvalidArgument as u32
         )))
@@ -473,7 +477,7 @@ fn refund_aid_after_expiry_returns_funds_to_donor() {
     let token_client = token::Client::new(&fx.env, &fx.token_addr);
 
     let expiry = fx.env.ledger().sequence() + 100;
-    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &None);
     advance_ledger(&fx.env, 101);
 
     let before = ContractSnapshot::capture(&fx);
@@ -490,6 +494,7 @@ fn refund_aid_after_expiry_returns_funds_to_donor() {
         .balance(&fx.contract_id, -500)
         .balance(&fx.donor, 500)
         .aid_status(aid_id, AidStatus::Refunded)
+        .search_index(std::vec::Vec::new())
         .assert();
 }
 
@@ -499,7 +504,7 @@ fn refund_aid_before_expiry_is_rejected() {
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
 
     let expiry = fx.env.ledger().sequence() + 100;
-    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &None);
 
     let before = ContractSnapshot::capture(&fx);
     let result = client.try_refund_aid(&aid_id, &fx.donor);
@@ -514,7 +519,7 @@ fn refund_claimed_aid_is_rejected() {
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
 
     let expiry = fx.env.ledger().sequence() + 100;
-    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &None);
     client.claim_aid(&aid_id, &fx.recipient);
     advance_ledger(&fx.env, 101);
 
@@ -531,7 +536,7 @@ fn refund_refunded_aid_is_rejected() {
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
 
     let expiry = fx.env.ledger().sequence() + 100;
-    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &None);
     advance_ledger(&fx.env, 101);
     client.refund_aid(&aid_id, &fx.donor);
 
@@ -549,7 +554,7 @@ fn refund_by_admin_is_successful() {
     let token_client = token::Client::new(&fx.env, &fx.token_addr);
 
     let expiry = fx.env.ledger().sequence() + 100;
-    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &None);
     advance_ledger(&fx.env, 101);
 
     let before = ContractSnapshot::capture(&fx);
@@ -565,6 +570,7 @@ fn refund_by_admin_is_successful() {
         .balance(&fx.contract_id, -500)
         .balance(&fx.donor, 500)
         .aid_status(aid_id, AidStatus::Refunded)
+        .search_index(std::vec::Vec::new())
         .assert();
 }
 
@@ -586,7 +592,7 @@ fn get_aid_returns_full_record() {
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
 
     let expiry = fx.env.ledger().sequence() + 100;
-    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &250, &expiry);
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &250, &expiry, &None);
 
     let record = client.get_aid(&aid_id).expect("record should exist");
     assert_eq!(record.id, aid_id);
@@ -626,6 +632,7 @@ fn search_filters_restricted_records_and_honors_permission_revocation() {
         &fx.recipient,
         &100,
         &(fx.env.ledger().sequence() + 100),
+        &None,
     );
 
     assert_eq!(client.search_aids(&outsider, &0, &10).records.len(), 0);
@@ -646,6 +653,7 @@ fn visibility_change_and_deletion_remove_discovery_entries() {
         &fx.recipient,
         &100,
         &(fx.env.ledger().sequence() + 100),
+        &None,
     );
 
     let before = ContractSnapshot::capture(&fx);
@@ -684,6 +692,7 @@ fn visibility_change_and_deletion_remove_discovery_entries() {
     let after = ContractSnapshot::capture(&fx);
     before
         .expect_delta(&after)
+        .aid_deleted(aid_id)
         .search_index(std::vec::Vec::new())
         .assert();
 }
@@ -697,6 +706,7 @@ fn repair_search_index_restores_missing_entries_and_removes_stale_ones() {
         &fx.recipient,
         &100,
         &(fx.env.ledger().sequence() + 100),
+        &None,
     );
 
     // Simulate a partial indexer write and a dangling entry from evicted data.
@@ -724,7 +734,7 @@ fn test_stable_cursor_pagination_on_aid_contract() {
     let mut ids = std::vec::Vec::new();
     let expiry = fx.env.ledger().sequence() + 1000;
     for _ in 0..5 {
-        ids.push(client.create_aid(&fx.donor, &fx.recipient, &100, &expiry));
+        ids.push(client.create_aid(&fx.donor, &fx.recipient, &100, &expiry, &None));
     }
 
     // Page 1: limit 2
@@ -807,11 +817,15 @@ fn test_aid_contract_import_dry_run_and_commit() {
     assert_eq!(commit_report.error_count, 0);
 
     // Verify stored records exist
-    let rec1 = client.get_imported_aid(&ext_1).expect("rec1 should be persisted");
+    let rec1 = client
+        .get_imported_aid(&ext_1)
+        .expect("rec1 should be persisted");
     assert_eq!(rec1.amount, 500);
     assert_eq!(rec1.recipient, fx.recipient);
 
-    let rec2 = client.get_imported_aid(&ext_2).expect("rec2 should be persisted");
+    let rec2 = client
+        .get_imported_aid(&ext_2)
+        .expect("rec2 should be persisted");
     assert_eq!(rec2.amount, 800);
 
     // 3. Acceptance criteria check: Repeated imports are idempotent where external IDs are present
@@ -865,7 +879,10 @@ fn test_aid_contract_import_partial_failure_handling() {
     let err = report.errors.get(0).unwrap();
     assert_eq!(err.row_id, 1);
     assert_eq!(err.reason, symbol_short!("zero_amt"));
-    assert_eq!(report.rollback_guidance.strategy, shared::import::RollbackStrategy::ForwardFix);
+    assert_eq!(
+        report.rollback_guidance.strategy,
+        shared::import::RollbackStrategy::ForwardFix
+    );
     assert_eq!(report.rollback_guidance.action, symbol_short!("part_fix"));
 
     // Valid row is committed, invalid row is not
@@ -873,3 +890,170 @@ fn test_aid_contract_import_partial_failure_handling() {
     assert!(client.get_imported_aid(&ext_bad).is_none());
 }
 
+// ---------------------------------------------------------------------------
+// Issue #140: Deterministic Storage Schema Version Guards Acceptance Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_storage_schema_guard_current_succeeds() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+
+    // Initialized contract stamps CURRENT_STORAGE_SCHEMA_VERSION (2)
+    assert_eq!(
+        client.get_storage_schema_version(),
+        shared::storage_version::CURRENT_STORAGE_SCHEMA_VERSION
+    );
+
+    // Schema validation succeeds on current version
+    assert_eq!(
+        client.validate_storage_schema(),
+        shared::storage_version::CURRENT_STORAGE_SCHEMA_VERSION
+    );
+
+    // Create an aid record
+    let aid_id = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &500,
+        &(fx.env.ledger().sequence() + 100),
+        &None,
+    );
+
+    // Guarded read succeeds and returns latest record
+    let guarded = client.get_aid_guarded(&aid_id);
+    assert!(guarded.is_some());
+    let rec = guarded.unwrap();
+    assert_eq!(rec.id, aid_id);
+    assert_eq!(rec.amount, 500);
+    assert_eq!(
+        rec.schema_version,
+        shared::compat::CURRENT_RECORD_SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn test_storage_schema_guard_missing_version_fails_safely() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+
+    let aid_id = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &500,
+        &(fx.env.ledger().sequence() + 100),
+        &None,
+    );
+
+    // Simulate missing schema version (e.g. unmigrated legacy contract)
+    fx.env.as_contract(&fx.contract_id, || {
+        shared::storage_version::remove_storage_schema_version(&fx.env);
+    });
+
+    // Guarded read fails safely with UnsupportedSchemaVersion
+    let read_res = client.try_get_aid_guarded(&aid_id);
+    assert_eq!(read_res, Err(Ok(AidError::UnsupportedSchemaVersion)));
+
+    // Validation fails safely with UnsupportedSchemaVersion
+    let val_res = client.try_validate_storage_schema();
+    assert_eq!(val_res, Err(Ok(AidError::UnsupportedSchemaVersion)));
+}
+
+#[test]
+fn test_storage_schema_guard_old_compatible_version_succeeds_and_upgrades() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+
+    let aid_id = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &500,
+        &(fx.env.ledger().sequence() + 100),
+        &None,
+    );
+
+    // Set schema version to V1 (old-compatible)
+    fx.env.as_contract(&fx.contract_id, || {
+        shared::storage_version::set_storage_schema_version(
+            &fx.env,
+            shared::storage_version::STORAGE_SCHEMA_V1,
+        );
+    });
+
+    assert_eq!(
+        client.get_storage_schema_version(),
+        shared::storage_version::STORAGE_SCHEMA_V1
+    );
+
+    // Old compatible schema read succeeds
+    assert_eq!(
+        client.validate_storage_schema(),
+        shared::storage_version::STORAGE_SCHEMA_V1
+    );
+    let rec = client.get_aid_guarded(&aid_id).unwrap();
+    assert_eq!(rec.id, aid_id);
+
+    // Upgrade schema from V1 to V2 succeeds
+    let upg = client.upgrade_storage_schema(
+        &fx.admin,
+        &shared::storage_version::CURRENT_STORAGE_SCHEMA_VERSION,
+    );
+    assert_eq!(upg, shared::storage_version::CURRENT_STORAGE_SCHEMA_VERSION);
+    assert_eq!(
+        client.get_storage_schema_version(),
+        shared::storage_version::CURRENT_STORAGE_SCHEMA_VERSION
+    );
+
+    // Non-admin upgrade rejected
+    let unauth_res = client.try_upgrade_storage_schema(
+        &fx.recipient,
+        &shared::storage_version::CURRENT_STORAGE_SCHEMA_VERSION,
+    );
+    assert_eq!(unauth_res, Err(Ok(AidError::Unauthorized)));
+}
+
+#[test]
+fn test_storage_schema_guard_incompatible_versions_fail_safely() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+
+    let aid_id = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &500,
+        &(fx.env.ledger().sequence() + 100),
+        &None,
+    );
+
+    // Case 1: Version 0 (invalid/unsupported)
+    fx.env.as_contract(&fx.contract_id, || {
+        shared::storage_version::set_storage_schema_version(&fx.env, 0);
+    });
+    assert_eq!(
+        client.try_validate_storage_schema(),
+        Err(Ok(AidError::UnsupportedSchemaVersion))
+    );
+    assert_eq!(
+        client.try_get_aid_guarded(&aid_id),
+        Err(Ok(AidError::UnsupportedSchemaVersion))
+    );
+
+    // Case 2: Future version 99 (incompatible)
+    fx.env.as_contract(&fx.contract_id, || {
+        shared::storage_version::set_storage_schema_version(&fx.env, 99);
+    });
+    assert_eq!(
+        client.try_validate_storage_schema(),
+        Err(Ok(AidError::UnsupportedSchemaVersion))
+    );
+    assert_eq!(
+        client.try_get_aid_guarded(&aid_id),
+        Err(Ok(AidError::UnsupportedSchemaVersion))
+    );
+
+    // Upgrading to unsupported version is rejected
+    assert_eq!(
+        client.try_upgrade_storage_schema(&fx.admin, &100),
+        Err(Ok(AidError::UnsupportedSchemaVersion))
+    );
+}

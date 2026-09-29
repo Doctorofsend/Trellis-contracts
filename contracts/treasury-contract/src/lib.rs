@@ -29,7 +29,7 @@
 //! - [`TreasuryContract::withdrawal_limit`]: View the max per-transaction limit
 //! - [`TreasuryContract::referral_contract`]: See the registered referral contract
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Bytes, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, Symbol};
 
 use shared::auth::{self, Permission, Role};
 use shared::errors::Error;
@@ -156,6 +156,10 @@ fn record_treasury_audit(
     Ok(())
 }
 
+fn zero_correlation_id(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0; 32])
+}
+
 #[contract]
 pub struct TreasuryContract;
 
@@ -188,6 +192,7 @@ impl TreasuryContract {
         )?;
         emit_module_initialized(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("treasury"),
             1,
             &admin,
@@ -213,6 +218,7 @@ impl TreasuryContract {
         )?;
         emit_permission_changed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("treasury"),
             symbol_short!("manager"),
             &who,
@@ -239,6 +245,7 @@ impl TreasuryContract {
         )?;
         emit_permission_changed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("treasury"),
             symbol_short!("manager"),
             &who,
@@ -269,6 +276,7 @@ impl TreasuryContract {
         )?;
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("treasury"),
             symbol_short!("wd_limit"),
             &caller,
@@ -311,9 +319,11 @@ impl TreasuryContract {
             Some(balance),
             Some(new_balance),
         )?;
-        emit_treasury_deposit(&env, category, &caller, &token, amount, new_balance);
+        emit_treasury_deposit(&env, &zero_correlation_id(&env),
+            category, &caller, &token, amount, new_balance);
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("treasury"),
             symbol_short!("deposit"),
             &caller,
@@ -387,9 +397,11 @@ impl TreasuryContract {
             Some(remaining),
         )?;
 
-        emit_treasury_withdrawal(&env, category, &to, &token, amount, remaining);
+        emit_treasury_withdrawal(&env, &zero_correlation_id(&env),
+            category, &to, &token, amount, remaining);
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("treasury"),
             symbol_short!("withdraw"),
             &caller,
@@ -440,6 +452,7 @@ impl TreasuryContract {
         )?;
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("treasury"),
             symbol_short!("sched_wd"),
             &caller,
@@ -492,15 +505,17 @@ impl TreasuryContract {
             &caller,
             TimelineEventType::PaymentSent,
             symbol_short!("exec_wd"),
-            symbol_short!("sched_exec"),
+            symbol_short!("schd_exec"),
             Some(token.clone()),
             Some(category.clone()),
             Some(balance),
             Some(remaining),
         )?;
-        emit_treasury_withdrawal(&env, category, &to, &token, amount, remaining);
+        emit_treasury_withdrawal(&env, &zero_correlation_id(&env),
+            category, &to, &token, amount, remaining);
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("treasury"),
             symbol_short!("exec_wd"),
             &caller,
@@ -569,6 +584,7 @@ impl TreasuryContract {
         );
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("treasury"),
             symbol_short!("emrg_wd"),
             &caller,
@@ -606,6 +622,7 @@ impl TreasuryContract {
         )?;
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("treasury"),
             symbol_short!("ref_ctr"),
             &caller,
@@ -660,9 +677,11 @@ impl TreasuryContract {
             Some(remaining),
         )?;
 
-        emit_commission_paid(&env, &recipient, &token, amount, env.ledger().timestamp());
+        emit_commission_paid(&env, &zero_correlation_id(&env),
+            &recipient, &token, amount, env.ledger().timestamp());
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("treasury"),
             symbol_short!("reward"),
             &referral_contract,
