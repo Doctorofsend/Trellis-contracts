@@ -61,5 +61,14 @@
     "migration_notes": "",
     "issue": 150,
     "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-09-29",
+    "impact": "internal",
+    "summary": "Added automated Soroban CPU/memory footprint profiling in CI (profile-budget job), comparing key contract calls against a checked-in baseline and failing on a >10% regression. No contract interface change.",
+    "migration_notes": "",
+    "issue": 192,
+    "pr": null
   }
 ]
