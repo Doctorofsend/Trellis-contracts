@@ -4,6 +4,7 @@ extern crate std;
 
 use super::*;
 use shared::Error as SharedError;
+use std::collections::BTreeMap;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Env,
@@ -81,6 +82,244 @@ fn advance_ledger(env: &Env, delta: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Contract state snapshot helpers
+// ---------------------------------------------------------------------------
+//
+// These helpers capture a deterministic view of the contract's observable
+// state (token balances, aid records, search index, pause flag) so that tests
+// can assert on *deltas* rather than re-deriving every field by hand.
+//
+// Usage:
+//   let before = ContractSnapshot::capture(&fx);
+//   client.claim_aid(&aid_id, &fx.recipient);
+//   let after = ContractSnapshot::capture(&fx);
+//   before.expect_delta(&after)
+//       .balance(&fx.contract_id, -500)
+//       .balance(&fx.recipient, 500)
+//       .aid_status(aid_id, AidStatus::Settled)
+//       .assert();
+//
+// Any field not explicitly listed in the expectation must be unchanged, and
+// any unexpected change fails the test with a readable diff.
+
+/// A point-in-time snapshot of everything a test typically cares about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContractSnapshot {
+    /// Token balance per address, keyed by the address' string form so the
+    /// ordering is deterministic across runs.
+    balances: BTreeMap<std::string::String, i128>,
+    /// Aid record per id, keyed by id for deterministic ordering.
+    aids: BTreeMap<u64, AidRecord>,
+    /// Ordered list of ids currently present in the search index.
+    search_index: std::vec::Vec<u64>,
+    /// Whether the contract is paused.
+    paused: bool,
+}
+
+impl ContractSnapshot {
+    fn capture(fx: &Fixture) -> Self {
+        let client = AidContractClient::new(&fx.env, &fx.contract_id);
+        let token_client = token::Client::new(&fx.env, &fx.token_addr);
+
+        let mut balances = BTreeMap::new();
+        for addr in [&fx.admin, &fx.donor, &fx.recipient, &fx.contract_id] {
+            balances.insert(
+                std::format!("{:?}", addr),
+                token_client.balance(addr),
+            );
+        }
+
+        let mut aids = BTreeMap::new();
+        let mut cursor: Option<u64> = None;
+        loop {
+            let page = client.list_aids_by_donor_cursor(&fx.donor, &cursor, &50);
+            for record in page.records.iter() {
+                aids.insert(record.id, record.clone());
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        let search_index = fx.env.as_contract(&fx.contract_id, || {
+            storage::get_search_index(&fx.env)
+                .iter()
+                .collect::<std::vec::Vec<u64>>()
+        });
+
+        let paused = fx.env.as_contract(&fx.contract_id, || {
+            fx.env
+                .storage()
+                .instance()
+                .get::<_, bool>(&Symbol::new(&fx.env, "paused"))
+                .unwrap_or(false)
+        });
+
+        ContractSnapshot {
+            balances,
+            aids,
+            search_index,
+            paused,
+        }
+    }
+
+    fn expect_delta(&self, after: &ContractSnapshot) -> DeltaExpectation<'_> {
+        DeltaExpectation {
+            before: self,
+            after,
+            expected_balances: BTreeMap::new(),
+            expected_statuses: BTreeMap::new(),
+            expected_search_index: None,
+            expected_paused: None,
+        }
+    }
+}
+
+/// Fluent builder describing the expected delta between two snapshots.
+struct DeltaExpectation<'a> {
+    before: &'a ContractSnapshot,
+    after: &'a ContractSnapshot,
+    expected_balances: BTreeMap<std::string::String, i128>,
+    expected_statuses: BTreeMap<u64, AidStatus>,
+    expected_search_index: Option<std::vec::Vec<u64>>,
+    expected_paused: Option<bool>,
+}
+
+impl<'a> DeltaExpectation<'a> {
+    fn balance(mut self, addr: &Address, delta: i128) -> Self {
+        self.expected_balances
+            .insert(std::format!("{:?}", addr), delta);
+        self
+    }
+
+    fn aid_status(mut self, aid_id: u64, status: AidStatus) -> Self {
+        self.expected_statuses.insert(aid_id, status);
+        self
+    }
+
+    fn search_index(mut self, ids: std::vec::Vec<u64>) -> Self {
+        self.expected_search_index = Some(ids);
+        self
+    }
+
+    fn paused(mut self, paused: bool) -> Self {
+        self.expected_paused = Some(paused);
+        self
+    }
+
+    fn assert(self) {
+        let mut failures: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+
+        // --- Balances -----------------------------------------------------
+        let mut all_addrs: std::collections::BTreeSet<&std::string::String> =
+            self.before.balances.keys().collect();
+        all_addrs.extend(self.after.balances.keys());
+        for addr in all_addrs {
+            let before = self.before.balances.get(addr).copied().unwrap_or(0);
+            let after = self.after.balances.get(addr).copied().unwrap_or(0);
+            let actual_delta = after - before;
+            let expected_delta = self.expected_balances.get(addr).copied().unwrap_or(0);
+            if actual_delta != expected_delta {
+                failures.push(std::format!(
+                    "balance delta for {}: expected {}, got {} (before={}, after={})",
+                    addr,
+                    expected_delta,
+                    actual_delta,
+                    before,
+                    after,
+                ));
+            }
+        }
+
+        // --- Aid statuses -------------------------------------------------
+        let mut all_ids: std::collections::BTreeSet<u64> = self.before.aids.keys().copied().collect();
+        all_ids.extend(self.after.aids.keys().copied());
+        for id in all_ids {
+            let before_status = self.before.aids.get(&id).map(|r| r.status.clone());
+            let after_status = self.after.aids.get(&id).map(|r| r.status.clone());
+            let expected = self.expected_statuses.get(&id).cloned();
+            match expected {
+                Some(exp) => {
+                    if after_status.as_ref() != Some(&exp) {
+                        failures.push(std::format!(
+                            "aid {} status: expected {:?}, got {:?} (before={:?})",
+                            id,
+                            exp,
+                            after_status,
+                            before_status,
+                        ));
+                    }
+                }
+                None => {
+                    if before_status != after_status {
+                        failures.push(std::format!(
+                            "aid {} status changed unexpectedly: {:?} -> {:?}",
+                            id,
+                            before_status,
+                            after_status,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // --- Search index -------------------------------------------------
+        match self.expected_search_index {
+            Some(expected) => {
+                if self.after.search_index != expected {
+                    failures.push(std::format!(
+                        "search index: expected {:?}, got {:?} (before={:?})",
+                        expected,
+                        self.after.search_index,
+                        self.before.search_index,
+                    ));
+                }
+            }
+            None => {
+                if self.before.search_index != self.after.search_index {
+                    failures.push(std::format!(
+                        "search index changed unexpectedly: {:?} -> {:?}",
+                        self.before.search_index,
+                        self.after.search_index,
+                    ));
+                }
+            }
+        }
+
+        // --- Paused flag --------------------------------------------------
+        match self.expected_paused {
+            Some(expected) => {
+                if self.after.paused != expected {
+                    failures.push(std::format!(
+                        "paused flag: expected {}, got {} (before={})",
+                        expected,
+                        self.after.paused,
+                        self.before.paused,
+                    ));
+                }
+            }
+            None => {
+                if self.before.paused != self.after.paused {
+                    failures.push(std::format!(
+                        "paused flag changed unexpectedly: {} -> {}",
+                        self.before.paused,
+                        self.after.paused,
+                    ));
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            panic!(
+                "unexpected contract state delta:\n  - {}",
+                failures.join("\n  - ")
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Claim lifecycle
 // ---------------------------------------------------------------------------
 
@@ -94,13 +333,22 @@ fn claim_transfers_escrow_and_settles() {
     let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
     assert_eq!(token_client.balance(&fx.contract_id), 500);
 
+    let before = ContractSnapshot::capture(&fx);
     client.claim_aid(&aid_id, &fx.recipient);
+    let after = ContractSnapshot::capture(&fx);
 
     assert_eq!(token_client.balance(&fx.recipient), 500);
     assert_eq!(token_client.balance(&fx.contract_id), 0);
 
     let record = client.get_aid(&aid_id).unwrap();
     assert_eq!(record.status, AidStatus::Settled);
+
+    before
+        .expect_delta(&after)
+        .balance(&fx.contract_id, -500)
+        .balance(&fx.recipient, 500)
+        .aid_status(aid_id, AidStatus::Settled)
+        .assert();
 }
 
 #[test]
@@ -126,8 +374,11 @@ fn claim_after_expiry_is_rejected() {
 
     advance_ledger(&fx.env, 101);
 
+    let before = ContractSnapshot::capture(&fx);
     let result = client.try_claim_aid(&aid_id, &fx.recipient);
     assert_eq!(result, Err(Ok(AidError::Expired)));
+    let after = ContractSnapshot::capture(&fx);
+    before.expect_delta(&after).assert();
 }
 
 #[test]
@@ -139,8 +390,11 @@ fn claim_by_wrong_address_is_unauthorized() {
     let expiry = fx.env.ledger().sequence() + 100;
     let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
 
+    let before = ContractSnapshot::capture(&fx);
     let result = client.try_claim_aid(&aid_id, &stranger);
     assert_eq!(result, Err(Ok(AidError::Unauthorized)));
+    let after = ContractSnapshot::capture(&fx);
+    before.expect_delta(&after).assert();
 }
 
 #[test]
@@ -152,8 +406,11 @@ fn claim_while_paused_is_rejected() {
     let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
     client.set_paused(&fx.admin, &true);
 
+    let before = ContractSnapshot::capture(&fx);
     let result = client.try_claim_aid(&aid_id, &fx.recipient);
     assert_eq!(result, Err(Ok(AidError::Paused)));
+    let after = ContractSnapshot::capture(&fx);
+    before.expect_delta(&after).paused(true).assert();
 }
 
 #[test]
@@ -218,12 +475,21 @@ fn refund_aid_after_expiry_returns_funds_to_donor() {
     let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
     advance_ledger(&fx.env, 101);
 
+    let before = ContractSnapshot::capture(&fx);
     client.refund_aid(&aid_id, &fx.donor);
+    let after = ContractSnapshot::capture(&fx);
 
     assert_eq!(token_client.balance(&fx.donor), MINT_AMOUNT);
     assert_eq!(token_client.balance(&fx.contract_id), 0);
     let record = client.get_aid(&aid_id).unwrap();
     assert_eq!(record.status, AidStatus::Refunded);
+
+    before
+        .expect_delta(&after)
+        .balance(&fx.contract_id, -500)
+        .balance(&fx.donor, 500)
+        .aid_status(aid_id, AidStatus::Refunded)
+        .assert();
 }
 
 #[test]
@@ -234,8 +500,11 @@ fn refund_aid_before_expiry_is_rejected() {
     let expiry = fx.env.ledger().sequence() + 100;
     let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
 
+    let before = ContractSnapshot::capture(&fx);
     let result = client.try_refund_aid(&aid_id, &fx.donor);
     assert_eq!(result, Err(Ok(AidError::NotExpiredYet)));
+    let after = ContractSnapshot::capture(&fx);
+    before.expect_delta(&after).assert();
 }
 
 #[test]
@@ -248,8 +517,11 @@ fn refund_claimed_aid_is_rejected() {
     client.claim_aid(&aid_id, &fx.recipient);
     advance_ledger(&fx.env, 101);
 
+    let before = ContractSnapshot::capture(&fx);
     let result = client.try_refund_aid(&aid_id, &fx.donor);
     assert_eq!(result, Err(Ok(AidError::AlreadyClaimed)));
+    let after = ContractSnapshot::capture(&fx);
+    before.expect_delta(&after).assert();
 }
 
 #[test]
@@ -262,8 +534,11 @@ fn refund_refunded_aid_is_rejected() {
     advance_ledger(&fx.env, 101);
     client.refund_aid(&aid_id, &fx.donor);
 
+    let before = ContractSnapshot::capture(&fx);
     let result = client.try_refund_aid(&aid_id, &fx.donor);
     assert_eq!(result, Err(Ok(AidError::AlreadyRefunded)));
+    let after = ContractSnapshot::capture(&fx);
+    before.expect_delta(&after).assert();
 }
 
 #[test]
@@ -276,11 +551,20 @@ fn refund_by_admin_is_successful() {
     let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry);
     advance_ledger(&fx.env, 101);
 
+    let before = ContractSnapshot::capture(&fx);
     client.refund_aid(&aid_id, &fx.admin);
+    let after = ContractSnapshot::capture(&fx);
 
     assert_eq!(token_client.balance(&fx.donor), MINT_AMOUNT);
     let record = client.get_aid(&aid_id).unwrap();
     assert_eq!(record.status, AidStatus::Refunded);
+
+    before
+        .expect_delta(&after)
+        .balance(&fx.contract_id, -500)
+        .balance(&fx.donor, 500)
+        .aid_status(aid_id, AidStatus::Refunded)
+        .assert();
 }
 
 // ---------------------------------------------------------------------------
@@ -363,15 +647,44 @@ fn visibility_change_and_deletion_remove_discovery_entries() {
         &(fx.env.ledger().sequence() + 100),
     );
 
+    let before = ContractSnapshot::capture(&fx);
     client.set_aid_search_visibility(&fx.admin, &aid_id, &false);
     assert_eq!(client.search_aids(&fx.donor, &0, &10).records.len(), 0);
+    let after = ContractSnapshot::capture(&fx);
+    before
+        .expect_delta(&after)
+        .search_index(std::vec::Vec::new())
+        .assert();
+
+    let before = ContractSnapshot::capture(&fx);
     client.set_aid_search_visibility(&fx.admin, &aid_id, &true);
     assert_eq!(client.search_aids(&fx.donor, &0, &10).records.len(), 1);
+    let after = ContractSnapshot::capture(&fx);
+    before
+        .expect_delta(&after)
+        .search_index(std::vec![aid_id])
+        .assert();
 
+    let before = ContractSnapshot::capture(&fx);
     client.claim_aid(&aid_id, &fx.recipient);
     assert_eq!(client.search_aids(&fx.donor, &0, &10).records.len(), 0);
+    let after = ContractSnapshot::capture(&fx);
+    before
+        .expect_delta(&after)
+        .balance(&fx.contract_id, -100)
+        .balance(&fx.recipient, 100)
+        .aid_status(aid_id, AidStatus::Settled)
+        .search_index(std::vec::Vec::new())
+        .assert();
+
+    let before = ContractSnapshot::capture(&fx);
     client.delete_aid(&fx.admin, &aid_id);
     assert_eq!(client.get_aid(&aid_id), None);
+    let after = ContractSnapshot::capture(&fx);
+    before
+        .expect_delta(&after)
+        .search_index(std::vec::Vec::new())
+        .assert();
 }
 
 #[test]

@@ -4,11 +4,12 @@ A comprehensive testing framework for all contracts in the trellis-contracts rep
 
 ## Overview
 
-The module is organized into 5 main components:
+The module is organized into 6 main components:
 - `mocks/` - Mock implementations of external dependencies (tokens, oracles, registry)
 - `helpers/` - Time manipulation, environment setup, and debugging utilities
 - `simulation/` - Deterministic transaction simulation and gas profiling
 - `fuzzing/` - Fuzzing harnesses for critical modules (Access Control, Payments, Upgradeability)
+- `snapshot/` - Contract state snapshot verification helpers
 - `examples/` - Example test suites demonstrating usage of all features
 
 ## Adding to Your Project
@@ -55,7 +56,7 @@ fn my_contract_test() {
 use testing::helpers::*;
 
 // Advance ledger sequence by 100 blocks
-advance_ledger_sequence(&env, 100);
+get_ledger_sequence(&env, 100);
 
 // Advance time by 24 hours (86400 seconds)
 advance_ledger_time(&env, 86400);
@@ -89,6 +90,89 @@ oracle_client.update_price(&btc_address, &450000000000, &6); // $45,000 with 6 d
 let registry_addr = create_mock_registry(&env, &admin);
 ```
 
+## Contract State Snapshots & Delta Verification
+
+The `snapshot` module provides reusable helpers for capturing contract state
+before and after an operation and asserting on the exact delta. This is the
+recommended way to test high-risk operations (balance transfers, ownership
+changes, status transitions) because it catches unintended side effects.
+
+### Basic Snapshot Diff
+
+```rust
+use testing::snapshot::*;
+use soroban_std::Symbol;
+
+// Capture the relevant state before the operation.
+let mut before = StateSnapshot::new();
+before.balance(Symbol::new(&env, "alice"), 1 000);
+before.balance(Symbol::new(&env, "bob"), 500);
+before.ownership(Symbol::new(&env, "owner"), Symbol::new(&env, "alice"));
+
+// Run the operation.
+client.transfer(&alice, &bob, &250);
+
+// Capture the state after.
+let mut after = StateSnapshot::new();
+after.balance(Symbol::new(&env, "alice"), 750);
+after.balance(Symbol::new(&env, "bob"), 750);
+after.ownership(Symbol::new(&env, "owner"), Symbol::new(&env, "alice"));
+
+// Assert the exact delta.
+let diff = before.diff(&after);
+diff.assert_changed(
+    &Symbol::new(&env, "alice"),
+    &SNapshotValue::Int(1 000),
+    &SnapshotValue::Int(750),
+);
+diff.assert_changed(
+    &Symbol::new(&env, "bob"),
+    &SNapshotValue::Int(500),
+    &SNapshotValue::Int(750),
+);
+```
+
+### Convenience Wrapper
+
+`capture_diff` captures the diff across an action without having to manually
+construct the after snapshot:
+
+```rust
+let diff = capture_difd(
+    || take_snapshot(&env, &client),
+    || client.transfer(&alice, &bob, &250),
+);
+diff.assert_changed(
+    &Symbol::new(&env, "alice"),
+    &SNapshotValue::Int(1 000),
+    &SnapshotValue::Int(750),
+);
+```
+
+### Assertion Helpers
+
+| Helper | Purpose |
+| --- | --- |
+| `assert_changed(&before, &after, &key, &from, &to)` | Assert a key changed from `from` to `to`. |
+| `assert_added(&before, &after, &key, &value)` | Assert a key was added with `value`. |
+| `assert_removed(&before, &after, &key)` | Assert a key was removed. |
+| `assert_no_change(&before, &after)` | Assert nothing changed. |
+| `assert_snapshot_eq(&expected, &actual)` | Assert two snapshots are equal. |
+
+All failures panic with a message that includes the expected and actual
+diffs, so unexpected deltas are immediately visible in test output.
+
+### Determinism
+
+Diffs are computed in a deterministic order:
+
+1. Keys present in the after snapshot but not the before snapshot (`Added`)
+2. Keys present in the before snapshot but not the after snapshot (`Removed`)
+3. Keys present in both with different values (`Changed`)
+
+Two snapshots with the same keys and values will always produce the same
+diff description, regardless of the order in which keys were recorded.
+
 ## Integration Sandbox Mode
 
 Run the primary workflow locally against fake external services — no
@@ -98,7 +182,7 @@ production credentials, real wallets, or irreversible records:
 use testing::sandbox::*;
 
 let mut sandbox = Sandbox::new(&env, SandboxConfig::new(1234)).unwrap();
-let asset = soroban_sdk::Symbol::new(&env, "sandbox_asset");
+let asset = soroban_std::Symbol::new(&env, "sandbox_asset");
 
 sandbox.oracle_mut().set_price(&asset, 1_000_000).unwrap();
 sandbox.token_mut().mint(&payer, 100_000).unwrap();
@@ -170,7 +254,7 @@ assert!(results.invariant_violations.is_empty(), "No invariant violations allowe
 ```rust
 let mut fuzzer = UpgradeabilityFuzzer::new(&env, Some(98765));
 let results = fuzzer.fuzz(&UpgradeabilityFuzzConfig::default());
-assert_eq!(results.unauthorized_attempts_blocked, results.failed_attempts);
+assert_eq(results.unauthorized_attempts_blocked, results.failed_attempts);
 ```
 
 ## Fault Injection
@@ -179,15 +263,15 @@ assert_eq!(results.unauthorized_attempts_blocked, results.failed_attempts);
 real dependency does — an actionable `Err`, not a panic — and that a failed
 call never leaves a partial write behind (issue #127). It covers:
 
-- **Oracle**: a hard failure (`FakeOracleAdapter::fail_for`) and a stale
+- `Oracle`: a hard failure (`FakeOracleAdapter::fail_for`) and a stale
   price (`mark_stale`) are both surfaced on the returned `Result`/`PriceQuote`
   rather than silently degrading.
-- **Token**: an insufficient-balance transfer leaves both balances and the
+- `Token`: an insufficient-balance transfer leaves both balances and the
   supply untouched, and a retry after topping up succeeds exactly once.
-- **RPC**: a submission timeout (`FakeRpcAdapter::set_fail_next`) does not
+- `RPC`: a submission timeout (`FakeRpcAdapter::set_fail_next`) does not
   advance the simulated ledger or record the operation, and the retry that
   follows lands exactly once.
-- **Cross-dependency**: a workflow where one leg fails after another has
+- `Cross-dependency`: a workflow where one leg fails after another has
   already succeeded — the successful leg's state is not rolled back or
   double-counted by the later failure.
 
@@ -221,5 +305,6 @@ The example tests in this module run automatically in CI. Add your contract's te
 3. Add fuzzing tests for all critical functions in your contract
 4. Profile gas usage of your contract's operations using the GasProfiler
 5. Use the mock contracts to isolate your contract's logic during testing
-6. Use sandbox mode when a test needs an oracle, token, or RPC round-trip:
+6. Use snapshot helpers to assert on the exact delta of high-risk operations
+7. Use sandbox mode when a test needs an oracle, token, or RPC round-trip:
    the fakes are deterministic, so failures are reproducible
