@@ -17,6 +17,7 @@
 //! - **AidRecord**: `Pending → Settled | Refunded`
 //! - **EscrowRecord**: `Active → Released | Refunded`
 //! - **Proposal**: `Pending → Executed`
+//! - **ContractRecord**: `Active → Deactivated → Active` (deprecation lifecycle)
 //!
 //! ## Usage Example
 //!
@@ -50,6 +51,10 @@ type Error = SharedError;
 
 // Re-export status enums from their respective modules for convenience
 pub use crate::payments::EscrowState;
+
+// ===========================================================================
+// Contract Record Deactivation Lifecycle
+// ===========================================================================
 
 // ===========================================================================
 // State Machine Trait (Generic Interface)
@@ -92,6 +97,136 @@ pub trait StateMachine {
     ) -> Result<Self::State, Self::Error> {
         Self::can_transition(current, next, context)?;
         Ok(next)
+    }
+}
+
+// ===========================================================================
+// Contract Record Lifecycle State Machine (Deprecation / Deactivation)
+// ===========================================================================
+
+/// Lifecycle state for a Trellis contract record.
+///
+/// Records begin `Active`. Deprecated records may be explicitly deactivated
+/// through an authorized transition, and optionally reactivated later.
+/// Deactivated records cannot execute restricted operations.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ContractRecordState {
+    /// Record is live and may execute restricted operations.
+    Active,
+    /// Record has been explicitly deactivated; restricted operations are blocked.
+    Deactivated,
+}
+
+/// State machine for `ContractRecord` deactivation lifecycle.
+///
+/// Valid transitions:
+/// - `Active → Deactivated` (authorized deactivation of an eligible record)
+/// - `Deactivated → Active` (authorized reactivation)
+///
+/// All other transitions (including idempotent re-application) are rejected
+/// so that callers must observe the current state before mutating it.
+pub struct ContractRecordStateMachine;
+
+/// Context required to validate a `ContractRecord` state transition.
+pub struct ContractRecordTransitionContext {
+    /// Address initiating the transition (must equal `authority`).
+    pub caller: Address,
+    /// Address authorized to deactivate/reactivate this record.
+    pub authority: Address,
+    /// Whether the record is eligible for deactivation (e.g. deprecated).
+    pub eligible_for_deactivation: bool,
+}
+
+impl StateMachine for ContractRecordStateMachine {
+    type State = ContractRecordState;
+    type TransitionContext = ContractRecordTransitionContext;
+    type Error = Error;
+
+    fn can_transition(
+        current: ContractRecordState,
+        next: ContractRecordState,
+        ctx: &ContractRecordTransitionContext,
+    ) -> Result<(), Error> {
+        match (current, next) {
+            // Active → Deactivated: only eligible records, only by authority.
+            (ContractRecordState::Active, ContractRecordState::Deactivated) => {
+                if ctx.caller != ctx.authority {
+                    return Err(Error::Unauthorized);
+                }
+                if !ctx.eligible_for_deactivation {
+                    return Err(Error::RecordNotEligibleForDeactivation);
+                }
+                Ok(())
+            }
+
+            // Deactivated → Active: reactivation by authority only.
+            (ContractRecordState::Deactivated, ContractRecordState::Active) => {
+                if ctx.caller != ctx.authority {
+                    return Err(Error::Unauthorized);
+                }
+                Ok(())
+            }
+
+            // Idempotent re-application rejected to force explicit state reads.
+            (ContractRecordState::Active, ContractRecordState::Active) => {
+                Err(Error::RecordAlreadyActive)
+            }
+            (ContractRecordState::Deactivated, ContractRecordState::Deactivated) => {
+                Err(Error::RecordAlreadyDeactivated)
+            }
+        }
+    }
+}
+
+/// Returns `true` if the record state permits restricted operations.
+///
+/// Restricted operations must consult this guard before executing.
+pub fn is_operational(state: ContractRecordState) -> bool {
+    matches!(state, ContractRecordState::Active)
+}
+
+/// Guard helper: returns `Ok(())` if the record may execute restricted
+/// operations, otherwise `Err(Error::RecordDeactivated)`.
+pub fn require_operational(state: ContractRecordState) -> Result<(), Error> {
+    if is_operational(state) {
+        Ok(())
+    } else {
+        Err(Error::RecordDeactivated)
+    }
+}
+
+/// Emit a structured event for a contract record deactivation state change.
+///
+/// Topics: `("record", "deact")`. Data: `(record_id, from_state, to_state,
+/// actor, timestamp)`.
+pub fn emit_deactivation_event(
+    env: &Env,
+    record_id: u64,
+    from_state: ContractRecordState,
+    to_state: ContractRecordState,
+    actor: &Address,
+    timestamp: u64,
+) {
+    use soroban_sdk::symbol_short;
+
+    env.events().publish(
+        (symbol_short!("record"), symbol_short!("deact")),
+        (
+            record_id,
+            contract_record_state_to_symbol(env, from_state),
+            contract_record_state_to_symbol(env, to_state),
+            actor.clone(),
+            timestamp,
+        ),
+    );
+}
+
+/// Convert `ContractRecordState` to a Symbol for event emission.
+pub fn contract_record_state_to_symbol(_env: &Env, state: ContractRecordState) -> Symbol {
+    use soroban_sdk::symbol_short;
+    match state {
+        ContractRecordState::Active => symbol_short!("active"),
+        ContractRecordState::Deactivated => symbol_short!("deactive"),
     }
 }
 
@@ -716,5 +851,131 @@ mod tests {
             &ctx,
         );
         assert_eq!(result, Err(Error::AlreadyExecuted));
+    }
+
+    // -----------------------------------------------------------------------
+    // Contract Record Deactivation Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn contract_record_active_to_deactivated_valid() {
+        let env = Env::default();
+        let authority = Address::generate(&env);
+        let ctx = ContractRecordTransitionContext {
+            caller: authority.clone(),
+            authority,
+            eligible_for_deactivation: true,
+        };
+
+        let result = ContractRecordStateMachine::can_transition(
+            ContractRecordState::Active,
+            ContractRecordState::Deactivated,
+            &ctx,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn contract_record_deactivate_unauthorized() {
+        let env = Env::default();
+        let caller = Address::generate(&env);
+        let authority = Address::generate(&env);
+        let ctx = ContractRecordTransitionContext {
+            caller,
+            authority,
+            eligible_for_deactivation: true,
+        };
+
+        let result = ContractRecordStateMachine::can_transition(
+            ContractRecordState::Active,
+            ContractRecordState::Deactivated,
+            &ctx,
+        );
+        assert_eq!(result, Err(Error::Unauthorized));
+    }
+
+    #[test]
+    fn contract_record_deactivate_ineligible() {
+        let env = Env::default();
+        let authority = Address::generate(&env);
+        let ctx = ContractRecordTransitionContext {
+            caller: authority.clone(),
+            authority,
+            eligible_for_deactivation: false,
+        };
+
+        let result = ContractRecordStateMachine::can_transition(
+            ContractRecordState::Active,
+            ContractRecordState::Deactivated,
+            &ctx,
+        );
+        assert_eq!(result, Err(Error::RecordNotEligibleForDeactivation));
+    }
+
+    #[test]
+    fn contract_record_reactivate_valid() {
+        let env = Env::default();
+        let authority = Address::generate(&env);
+        let ctx = ContractRecordTransitionContext {
+            caller: authority.clone(),
+            authority,
+            eligible_for_deactivation: false,
+        };
+
+        let result = ContractRecordStateMachine::can_transition(
+            ContractRecordState::Deactivated,
+            ContractRecordState::Active,
+            &ctx,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn contract_record_reactivate_unauthorized() {
+        let env = Env::default();
+        let caller = Address::generate(&env);
+        let authority = Address::generate(&env);
+        let ctx = ContractRecordTransitionContext {
+            caller,
+            authority,
+            eligible_for_deactivation: false,
+        };
+
+        let result = ContractRecordStateMachine::can_transition(
+            ContractRecordState::Deactivated,
+            ContractRecordState::Active,
+            &ctx,
+        );
+        assert_eq!(result, Err(Error::Unauthorized));
+    }
+
+    #[test]
+    fn contract_record_restricted_use_blocked_when_deactivated() {
+        assert!(require_operational(ContractRecordState::Active).is_ok());
+        assert_eq!(
+            require_operational(ContractRecordState::Deactivated),
+            Err(Error::RecordDeactivated)
+        );
+        assert!(!is_operational(ContractRecordState::Deactivated));
+    }
+
+    #[test]
+    fn contract_record_deactivation_event_emitted() {
+        use soroban_sdk::testutils::Events as _;
+
+        let env = Env::default();
+        let authority = Address::generate(&env);
+
+        emit_deactivation_event(
+            &env,
+            42,
+            ContractRecordState::Active,
+            ContractRecordState::Deactivated,
+            &authority,
+            1_000,
+        );
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
     }
 }
