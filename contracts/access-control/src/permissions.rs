@@ -32,6 +32,8 @@ pub enum Action {
     CancelInvitation(Address),
     /// Read the maintainer-only audit trail.
     ReadAuditTrail,
+    /// Pause a scoped family of operations via the emergency circuit breaker.
+    PauseScope(Symbol),
 }
 
 /// How widely an action's authority extends.
@@ -90,6 +92,11 @@ pub fn policy_for(action: &Action) -> ActionPolicy {
         },
         Action::ReadAuditTrail => ActionPolicy {
             permission: Permission::ReadAuditTrail,
+            role: Role::Admin,
+            scope: ActionScope::Global,
+        },
+        Action::PauseScope(_) => ActionPolicy {
+            permission: Permission::ManageConfiguration,
             role: Role::Admin,
             scope: ActionScope::Global,
         },
@@ -207,6 +214,11 @@ mod tests {
                 Permission::ReadAuditTrail,
                 ActionScope::Global,
             ),
+            (
+                Action::PauseScope(symbol_short!("ops")),
+                Permission::ManageConfiguration,
+                ActionScope::Global,
+            ),
         ];
 
         for (action, permission, scope) in matrix {
@@ -230,6 +242,7 @@ mod tests {
             Action::ConfigureRoleRegistry,
             Action::AssignRoles,
             Action::ReadAuditTrail,
+            Action::PauseScope(symbol_short!("ops")),
         ];
         for action in global {
             assert_eq!(policy_for(&action).scope, ActionScope::Global);

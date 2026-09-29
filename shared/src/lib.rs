@@ -5,6 +5,7 @@ pub mod analytics;
 pub mod auth;
 pub mod batch;
 pub mod canonical;
+pub mod circuit_breaker;
 pub mod client;
 pub mod compat;
 pub mod config;
@@ -13,12 +14,6 @@ pub mod errors;
 pub mod error_taxonomy;
 pub mod events;
 pub mod feature_flags;
-// `health`, `reconciliation` and `telemetry` are re-exported below
-// (`pub use health::{...}` etc.) but were never declared as modules here —
-// a build break on `upstream/main` for anything that depends on this crate
-// (every contract does), since an unresolved `pub use` path is a hard
-// compile error, not a lint. See issue #125's PR for how this surfaced: it
-// couldn't be verified without the workspace building at all.
 pub mod health;
 pub mod history;
 pub mod idempotency;
@@ -109,7 +104,7 @@ pub use retention::{
 pub use events::{
     emit, emit_collection_registered, emit_nft_auction, emit_nft_bid, emit_nft_listed,
     emit_nft_offer, emit_nft_settle, emit_nft_sold, emit_royalty_paid, AID_CLAIMED, AID_CREATED,
-    AID_REFUNDED, AID_SETTLED, COMMISSION_PAID, CONTRACT_PAUSED, CONTRACT_RESUMED,
+    AID_REFUNDED, AIDSETTLED, COMMISSION_PAID, CONTRACT_PAUSED, CONTRACT_RESUMED,
     CONTRACT_UPGRADED, PARAMETER_CHANGED, PAYMENT_ESCROW_CREATED, PAYMENT_ESCROW_REFUNDED,
     PAYMENT_ESCROW_RELEASED, PAYMENT_FEE, PAYMENT_TRANSFER, REFERRAL_ACCRUED, REFERRAL_REGISTERED,
     REFERRER_SET, TIER_CONFIG_SET, TREASURY_DEPOSIT, TREASURY_EMERGENCY_WITHDRAW, TREASURY_SET,
@@ -132,7 +127,7 @@ pub use payments::{
     FeeConfig,
 };
 pub use recovery::{
-    abandon, complete_step, diagnostics, fail_step, is_stuck, next_action,
+    abandom, complete_step, diagnostics, fail_step, is_stuck, next_action,
     open_operation, resume, OperationKind, OperationState, RecoveryCheckpoint,
     RecoveryDiagnostics, RecoveryError, RecoveryStep, StepOutcome,
 };
@@ -207,6 +202,11 @@ pub use preflight::{
     PreflightInput, PreflightOperation, PreflightReport, PreflightStatus, RiskLevel,
     EXPIRY_WARNING_WINDOW_LEDGERS, HIGH_VALUE_WARNING_BPS,
 };
+pub use circuit_breaker::{
+    all_scopes, is_scope_paused, pause_all, pause_scope, pause_status, require_not_paused,
+    resume_all, resume_scope, SCOPE_AID_CREATION, SCOPE_CLAIM_SETTLEMENT, SCOPE_IMPORT,
+    SCOPE_ORACLE, SCOPE_REBALANCE, SCOPE_TREASURY,
+};
 
 #[cfg(test)]
 mod test_reconciliation;
@@ -232,6 +232,8 @@ mod test_pagination;
 mod test_client;
 #[cfg(test)]
 mod test_import;
+#[cfg(test)]
+mod test_circuit_breaker;
 
 // Deterministic ledger-sequence harness controls (Issue #156). Test-only: the
 // harness sets the ledger sequence/timestamp explicitly and never reads the
