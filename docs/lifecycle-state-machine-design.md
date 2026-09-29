@@ -1,5 +1,9 @@
 # Lifecycle State Machine Design
 
+## Deactivation Flow for Deprecated Records
+
+Deprecated contract records are deactivated through an explicit `Deactivated` state rather than being ignored or deleted implicitly. Deactivation is authorized, emits an event, and blocks restricted operations until the record is reactivated.
+
 ## Issue Context
 **Issue #27**: Implement deterministic lifecycle state machine for core records
 
@@ -58,6 +62,13 @@ Refunded → Refunded  ❌ (idempotency check)
 - `Pending → Settled`: Requires current_ledger <= expiry_ledger AND caller == recipient
 - `Pending → Refunded`: Requires current_ledger > expiry_ledger
 
+**Deactivation:**
+- `Pending → Deactivated`: Requires caller == admin AND record is eligible (not terminal)
+- `Deactivated → Pending`: Optional reactivation by admin
+- `Settled → Deactivated` ❌ (terminal records cannot be deactivated)
+- `Refunded → Deactivated` ❌ (terminal records cannot be deactivated)
+- `Deactivated → Settled` ❌ (must reactivate before settling)
+
 #### 2. EscrowRecord Lifecycle
 
 **States:**
@@ -89,6 +100,13 @@ Refunded → Refunded  ❌
 - `Active → Released`: Requires current_ledger <= expiry_ledger
 - `Active → Refunded`: Typically after expiry, but admin may override
 
+**Deactivation:**
+- `Active → Deactivated`: Requires caller == admin AND record is eligible (not terminal)
+- `Deactivated → Active`: Optional reactivation by admin
+- `Released → Deactivated` ❌ (terminal records cannot be deactivated)
+- `Refunded → Deactivated` ❌ (terminal records cannot be deactivated)
+- `Deactivated → Released` ❌ (must reactivate before releasing)
+
 #### 3. Proposal Lifecycle
 
 **States:**
@@ -112,6 +130,12 @@ Executed → Executed  ❌
 
 **Business Rules:**
 - `Pending → Executed`: Requires approval_count >= threshold
+
+**Deactivation:**
+- `Pending → Deactivated`: Requires caller == admin AND record is eligible (not terminal)
+- `Deactivated → Pending`: Optional reactivation by admin
+- `Executed → Deactivated` ❌ (terminal records cannot be deactivated)
+- `Deactivated → Executed` ❌ (must reactivate before executing)
 
 ### Implementation Architecture
 
