@@ -47,7 +47,11 @@ pub mod dashboard;
 
 // Re-export the most commonly-needed items at crate root for ergonomic use.
 pub use dashboard::{
-    generate_dashboard, DashboardReport, HealthCategory, RedactedDeadLetter,
+    generate_dashboard, generate_enhanced_dashboard, DashboardReport, HealthCategory, 
+    RedactedDeadLetter, PartialFailure, RedactedPartialFailure, FailureGroup,
+    FailureSeverity, OperationType, FailureState, ExternalReference,
+    create_partial_failure, add_external_reference, redact_partial_failure,
+    group_by_operation_type, group_by_severity, group_by_age, group_by_retryability,
 };
 pub use disclosure::{
     DetailField, DetailSeverity, TransactionDetail, TransactionDetailBuilder,
