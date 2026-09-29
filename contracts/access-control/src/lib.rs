@@ -58,9 +58,41 @@ pub enum AccessControlError {
     RateLimitExceeded = 212,
     AlreadyInitialized = 213,
     AuditFailed = 214,
+    /// The requested operation is currently paused by the circuit breaker.
+    OperationPaused = 215,
+    /// The pause scope is not recognised.
+    InvalidPauseScope = 216,
+    /// The operation is not currently paused.
+    NotPaused = 217,
 }
 
 type ContractResult<T> = core::result::Result<T, AccessControlError>;
+
+/// Pause scopes recognised by the emergency circuit breaker.  Each scope
+/// maps to an operation family so that pausing one family does not disable
+/// safe reads or unrelated flows.
+const PAUSE_SCOPE_ROLES: Symbol = symbol_short!("roles");
+const PAUSE_SCOPE_ADMINS: Symbol = symbol_short!("admins");
+const PAUSE_SCOPE_INVITES: Symbol = symbol_short!("invites");
+
+fn is_valid_pause_scope(scope: &Symbol) -> bool {
+    *scope == PAUSE_SCOPE_ROLES
+        || *scope == PAUSE_SCOPE_ADMINS
+        || *scope == PAUSE_SCOPE_INVITES
+}
+
+/// Fail with [`AccessControlError::OperationPaused`] when `scope` is paused.
+fn require_not_paused(env: &Env, scope: Symbol) -> ContractResult<()> {
+    if env
+        .storage()
+        .instance()
+        .get(&DataKey::PausedScope(scope))
+        .unwrap_or(false)
+    {
+        return Err(AccessControlError::OperationPaused);
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -87,6 +119,12 @@ enum DataKey {
     InviteCount(Address),
     /// Track last invite time per inviter: `inviter -> u64`
     LastInviteTime(Address),
+    /// Whether a pause scope is currently active: `scope -> bool`.
+    PausedScope(Symbol),
+    /// Address that most recently paused a scope: `scope -> Address`.
+    PausedBy(Symbol),
+    /// Ledger timestamp when a scope was paused: `scope -> u64`.
+    PausedAt(Symbol),
 }
 
 #[contracttype]
@@ -110,6 +148,8 @@ const EV_ADMIN_REMOVED: Symbol = symbol_short!("ac_ar");
 const EV_INVITE_CREATED: Symbol = symbol_short!("ac_ic");
 const EV_INVITE_ACCEPTED: Symbol = symbol_short!("ac_ia");
 const EV_INVITE_REVOKED: Symbol = symbol_short!("ac_ir");
+const EV_PAUSED: Symbol = symbol_short!("ac_pz");
+const EV_RESUMED: Symbol = symbol_short!("ac_rz");
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -165,6 +205,113 @@ impl AccessControlContract {
         // Emit: role created for super_admin.
         env.events()
             .publish((EV_ROLE_CREATED,), (symbol_short!("super"), super_admin));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Emergency circuit breaker
+    // -----------------------------------------------------------------------
+
+    /// Returns `true` when the given pause scope is currently active.
+    pub fn is_paused(env: Env, scope: Symbol) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::PausedScope(scope))
+            .unwrap_or(false)
+    }
+
+    /// Pause a scoped operation family.  Only admins may call this.
+    ///
+    /// # Authorization
+    /// Requires the `ManageMaintainers` action permission.  Unauthorized
+    /// callers receive [`AccessControlError::NotAdmin`].  Unknown scopes
+    /// yield [`AccessControlError::InvalidPauseScope`].
+    pub fn pause(
+        env: Env,
+        caller: Address,
+        scope: Symbol,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller, &Action::ManageMaintainers)?;
+        if !is_valid_pause_scope(&scope) {
+            return Err(AccessControlError::InvalidPauseScope);
+        }
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedScope(scope.clone()))
+            .unwrap_or(false)
+        {
+            return Err(AccessControlError::OperationPaused);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PausedScope(scope.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::PausedBy(scope.clone()), &caller);
+        env.storage()
+            .instance()
+            .set(&DataKey::PausedAt(scope.clone()), &env.ledger().timestamp());
+        record_access_audit(
+            &env,
+            &caller,
+            TimelineEventType::ConfigChanged,
+            symbol_short!("pause"),
+            symbol_short!("breaker"),
+            None,
+            Some(scope.clone()),
+            Some(0),
+            Some(1),
+        )?;
+        env.events().publish((EV_PAUSED,), (caller, scope));
+        Ok(())
+    }
+
+    /// Resume a previously paused scope.  Only admins may call this.
+    ///
+    /// # Authorization
+    /// Requires the `ManageMaintainers` action permission.  Unauthorized
+    /// callers receive [`AccessControlError::NotAdmin`].  Unknown scopes
+    /// yield [`AccessControlError::InvalidPauseScope`].  Scopes that are not
+    /// currently paused yield [`AccessControlError::NotPaused`].
+    pub fn resume(
+        env: Env,
+        caller: Address,
+        scope: Symbol,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller, &Action::ManageMaintainers)?;
+        if !is_valid_pause_scope(&scope) {
+            return Err(AccessControlError::InvalidPauseScope);
+        }
+        if !env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedScope(scope.clone()))
+            .unwrap_or(false)
+        {
+            return Err(AccessControlError::NotPaused);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PausedScope(scope.clone()), &false);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PausedBy(scope.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::PausedAt(scope.clone()));
+        record_access_audit(
+            &env,
+            &caller,
+            TimelineEventType::ConfigChanged,
+            symbol_short!("resume"),
+            symbol_short!("breaker"),
+            None,
+            Some(scope.clone()),
+            Some(1),
+            Some(0),
+        )?;
+        env.events().publish((EV_RESUMED,), (caller, scope));
         Ok(())
     }
 

@@ -17,6 +17,9 @@ pub const PARAMETER_CHANGED: Symbol = symbol_short!("param_chg");
 pub const CONTRACT_PAUSED: Symbol = symbol_short!("paused");
 pub const CONTRACT_RESUMED: Symbol = symbol_short!("resumed");
 pub const CONTRACT_UPGRADED: Symbol = symbol_short!("upgraded");
+pub const CONTRACT_SCOPED_PAUSED: Symbol = symbol_short!("sc_pause");
+pub const CONTRACT_SCOPED_RESUMED: Symbol = symbol_short!("sc_resum");
+pub const PAUSE_SCOPE_SET: Symbol = symbol_short!("sc_set");
 pub const REFERRAL_REGISTERED: Symbol = symbol_short!("ref_reg");
 pub const PROPOSAL_CREATED: Symbol = symbol_short!("prop_new");
 pub const PROPOSAL_APPROVED: Symbol = symbol_short!("prop_apr");
@@ -298,6 +301,42 @@ pub fn emit_contract_resumed(
     env.events().publish(
         (symbol_short!("contract"), symbol_short!("resumed"), correlation_id.clone()),
         (actor.clone(), resumed_at),
+    );
+}
+
+/// Emits `ContractScopedPaused`.
+///
+/// Topics: `("contract", "sc_pause")`
+///
+/// Data: `(actor, scope, paused_at)`
+pub fn emit_contract_scoped_paused(
+    env: &Env,
+    correlation_id: &BytesN<32>,
+    actor: &Address,
+    scope: Symbol,
+    paused_at: u64,
+) {
+    env.events().publish(
+        (symbol_short!("contract"), symbol_short!("sc_pause"), correlation_id.clone()),
+        (actor.clone(), scope, paused_at),
+    );
+}
+
+/// Emits `ContractScopedResumed`.
+///
+/// Topics: `("contract", "sc_resum")`
+///
+/// Data: `(actor, scope, resumed_at)`
+pub fn emit_contract_scoped_resumed(
+    env: &Env,
+    correlation_id: &BytesN<32>,
+    actor: &Address,
+    scope: Symbol,
+    resumed_at: u64,
+) {
+    env.events().publish(
+        (symbol_short!("contract"), symbol_short!("sc_resum"), correlation_id.clone()),
+        (actor.clone(), scope, resumed_at),
     );
 }
 

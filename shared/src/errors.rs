@@ -30,6 +30,12 @@ pub enum Error {
     InvalidArgument = 10,
     /// The operation requires the contract to be paused but it is currently active.
     NotPaused = 11,
+    /// The requested pause scope is not recognised by this contract.
+    InvalidPauseScope = 29,
+    /// The requested operation is not covered by any registered pause scope.
+    UnknownOperation = 30,
+    /// The pause scope is already in the requested state.
+    PauseScopeUnchanged = 31,
     /// The proposal was not found.
     ProposalNotFound = 12,
     /// The caller has already approved this proposal.

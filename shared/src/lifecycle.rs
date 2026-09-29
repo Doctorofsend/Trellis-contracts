@@ -42,7 +42,7 @@
 //! record.status = AidStatus::Settled;
 //! ```
 
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{contracttype, Address, Env, Symbol};
 
 use crate::errors::Error as SharedError;
 
@@ -51,6 +51,149 @@ type Error = SharedError;
 
 // Re-export status enums from their respective modules for convenience
 pub use crate::payments::EscrowState;
+
+// ===========================================================================
+// Emergency Circuit Breaker (Scoped Pause)
+// ===========================================================================
+
+/// Operation families that can be independently paused by the circuit breaker.
+///
+/// Each scope maps to a family of contract actions. Pausing a scope blocks
+/// only the operations in that family; reads and unrelated flows continue.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PauseScope {
+    /// Aid claim, settle, and refund operations.
+    Aid = 0,
+    /// Escrow release and refund operations.
+    Escrow = 1,
+    /// Proposal execution operations.
+    Proposal = 2,
+    /// Contract record deactivation/reactivation operations.
+    ContractRecord = 3,
+}
+
+/// Returns the stable symbol used to identify a pause scope in storage and events.
+pub fn pause_scope_to_symbol(_env: &Env, scope: PauseScope) -> Symbol {
+    use soroban_sdk::symbol_short;
+    match scope {
+        PauseScope::Aid => symbol_short!("aid"),
+        PauseScope::Escrow => symbol_short!("escrow"),
+        PauseScope::Proposal => symbol_short!("proposal"),
+        PauseScope::ContractRecord => symbol_short!("record"),
+    }
+}
+
+/// Storage key namespace for circuit breaker pause flags.
+#[contracttype]
+#[derive(Clone)]
+pub enum CircuitBreakerKey {
+    /// Pause flag for a specific scope.
+    Paused(PauseScope),
+    /// Address authorized to pause/resume scopes.
+    Authority,
+}
+
+/// Returns `true` if the given scope is currently paused.
+pub fn is_paused(env: &Env, scope: PauseScope) -> bool {
+    env.storage()
+        .persistent()
+        .get(&CircuitBreakerKey::Paused(scope))
+        .unwrap_or(false)
+}
+
+/// Guard helper: returns `Ok(())` if the scope is not paused, otherwise
+/// `Err(Error::OperationPaused)`.
+pub fn require_not_paused(env: &Env, scope: PauseScope) -> Result<(), Error> {
+    if is_paused(env, scope) {
+        Err(Error::OperationPaused)
+    } else {
+        Ok(())
+    }
+}
+
+/// Authorized entrypoint to pause a scope.
+///
+/// The caller must equal the stored circuit breaker authority. Emits a
+/// `("breaker", "pause")` event with `(scope, actor, timestamp)`.
+pub fn pause_scope(
+    env: &Env,
+    caller: &Address,
+    scope: PauseScope,
+    timestamp: u64,
+) -> Result<(), Error> {
+    caller.require_auth();
+    let authority: Address = env
+        .storage()
+        .persistent()
+        .get(&CircuitBreakerKey::Authority)
+        .ok_or(Error::Unauthorized)?;
+    if caller != &authority {
+        return Err(Error::Unauthorized);
+    }
+    env.storage()
+        .persistent()
+        .set(&CircuitBreakerKey::Paused(scope), &true);
+    emit_pause_event(env, scope, caller, timestamp);
+    Ok(())
+}
+
+/// Authorized entrypoint to resume a scope.
+///
+/// The caller must equal the stored circuit breaker authority. Emits a
+/// `("breaker", "resume")` event with `(scope, actor, timestamp)`.
+pub fn resume_scope(
+    env: &Env,
+    caller: &Address,
+    scope: PauseScope,
+    timestamp: u64,
+) -> Result<(), Error> {
+    caller.require_auth();
+    let authority: Address = env
+        .storage()
+        .persistent()
+        .get(&CircuitBreakerKey::Authority)
+        .ok_or(Error::Unauthorized)?;
+    if caller != &authority {
+        return Err(Error::Unauthorized);
+    }
+    env.storage()
+        .persistent()
+        .set(&CircuitBreakerKey::Paused(scope), &false);
+    emit_resume_event(env, scope, caller, timestamp);
+    Ok(())
+}
+
+/// Emit a structured event for a pause action.
+///
+/// Topics: `("breaker", "pause")`. Data: `(scope, actor, timestamp)`.
+pub fn emit_pause_event(env: &Env, scope: PauseScope, actor: &Address, timestamp: u64) {
+    use soroban_sdk::symbol_short;
+    env.events().publish(
+        (symbol_short!("breaker"), symbol_short!("pause")),
+        (
+            pause_scope_to_symbol(env, scope),
+            actor.clone(),
+            timestamp,
+        ),
+    );
+}
+
+/// Emit a structured event for a resume action.
+///
+/// Topics: `("breaker", "resume")`. Data: `(scope, actor, timestamp)`.
+pub fn emit_resume_event(env: &Env, scope: PauseScope, actor: &Address, timestamp: u64) {
+    use soroban_sdk::symbol_short;
+    env.events().publish(
+        (symbol_short!("breaker"), symbol_short!("resume")),
+        (
+            pause_scope_to_symbol(env, scope),
+            actor.clone(),
+            timestamp,
+        ),
+    );
+}
 
 // ===========================================================================
 // Contract Record Deactivation Lifecycle
