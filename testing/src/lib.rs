@@ -9,6 +9,7 @@ pub mod examples;
 pub mod fault_injection;
 pub mod fuzzing;
 pub mod helpers;
+pub mod lifecycle_events;
 pub mod migration;
 pub mod mocks;
 pub mod sandbox;
@@ -18,6 +19,7 @@ pub mod upgrade;
 
 pub use fuzzing::*;
 pub use helpers::*;
+pub use lifecycle_events::*;
 pub use migration::*;
 pub use mocks::*;
 pub use sandbox::*;

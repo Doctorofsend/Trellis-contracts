@@ -43,5 +43,14 @@
     "migration_notes": "",
     "issue": 126,
     "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-09-29",
+    "impact": "compatible",
+    "summary": "Added shared::lifecycle_events: a canonical, versioned lifecycle event envelope with schema version and resource IDs, plus an ordered-sequence assertion harness in the testing crate.",
+    "migration_notes": "",
+    "issue": 144,
+    "pr": null
   }
 ]
