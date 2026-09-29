@@ -6,7 +6,10 @@ license = "MIT"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+# "rlib" is required (alongside "cdylib") so the `testing` crate's
+# cross-contract fuzzing harness (Issue #191) can depend on this crate as
+# a normal Rust library and exercise the real contract logic directly.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }

@@ -1550,8 +1550,12 @@ dependencies = [
 name = "testing"
 version = "0.1.0"
 dependencies = [
+ "aid-contract",
+ "proptest",
+ "referral-contract",
  "shared",
  "soroban-sdk",
+ "treasury-contract",
 ]
 
 [[package]]
