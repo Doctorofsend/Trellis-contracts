@@ -119,6 +119,11 @@ pub enum TimelineEventType {
     ContractPaused,
     /// The contract resumed.
     ContractResumed,
+    /// A scheduled action was rejected because it was attempted before its
+    /// valid time window opened.
+    ScheduledActionEarly,
+    /// A scheduled action was rejected because its time window had expired.
+    ScheduledActionLate,
 }
 
 /// A stable pointer at the resource an entry describes.
@@ -273,6 +278,191 @@ pub enum TimelineKey {
     AuditEntry(u64),
     /// Versioned domain-action audit entry by `seq`.
     ActionAuditEntry(u64),
+    /// Time-window configuration for a scheduled action, keyed by action id.
+    ScheduledWindow(u64),
+    /// Execution record for a scheduled action, keyed by action id.
+    ScheduledExecution(u64),
+}
+
+// ---------------------------------------------------------------------------
+// Time-window validation
+// ---------------------------------------------------------------------------
+
+/// A half-open ledger-time window `[start, end)` during which a scheduled
+/// action may execute.
+///
+/// `start` is inclusive and `end` is exclusive, so an action attempted exactly
+/// at `start` is valid and one attempted exactly at `end` is late. `stale_after`
+/// is an optional absolute ledger timestamp beyond which the action is
+/// considered stale even if the window has not formally closed; when `None`,
+/// staleness is governed solely by `end`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeWindow {
+    /// Earliest ledger timestamp at which the action may execute (inclusive).
+    pub start: u64,
+    /// Ledger timestamp at which the window closes (exclusive).
+    pub end: u64,
+    /// Optional absolute staleness cutoff; must be `<= end` when set.
+    pub stale_after: Option<u64>,
+}
+
+/// Outcome of validating a scheduled action against its window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WindowStatus {
+    /// The action may execute now.
+    Valid,
+    /// The action was attempted before `start`.
+    Early,
+    /// The action was attempted at or after `end`.
+    Late,
+    /// The action was attempted at or after `stale_after`.
+    Stale,
+}
+
+impl TimeWindow {
+    /// Validates `now` against this window, returning the precise failure mode.
+    ///
+    /// Ordering of checks matters: an action attempted before `start` is always
+    /// `Early` even if `stale_after` has also passed (which can only happen if
+    /// the window was misconfigured), so callers get the most actionable error.
+    pub fn validate(&self, now: u64) -> WindowStatus {
+        if now < self.start {
+            return WindowStatus::Early;
+        }
+        if now >= self.end {
+            return WindowStatus::Late;
+        }
+        if let Some(stale) = self.stale_after {
+            if now >= stale {
+                return WindowStatus::Stale;
+            }
+        }
+        WindowStatus::Valid
+    }
+
+    /// Returns `true` when `start < end` and any `stale_after` is `<= end`.
+    pub fn is_well_formed(&self) -> bool {
+        if self.start >= self.end {
+            return false;
+        }
+        match self.stale_after {
+            Some(stale) => stale <= self.end,
+            None => true,
+        }
+    }
+}
+
+/// Persists the time window for a scheduled action.
+///
+/// Rejects malformed windows with [`Error::InvalidArgument`] so a bad window
+/// can never be stored and later silently reject every execution attempt.
+pub fn set_scheduled_window(env: &Env, action_id: u64, window: TimeWindow) -> Result<(), Error> {
+    if !window.is_well_formed() {
+        return Err(Error::InvalidArgument);
+    }
+    persistent_set(env, &TimelineKey::ScheduledWindow(action_id), &window);
+    Ok(())
+}
+
+/// Loads the time window for a scheduled action, if one was configured.
+pub fn scheduled_window(env: &Env, action_id: u64) -> Option<TimeWindow> {
+    persistent_get(env, &TimelineKey::ScheduledWindow(action_id))
+}
+
+/// Validates a scheduled action against its configured window using the
+/// current ledger timestamp.
+///
+/// Returns [`Error::NotFound`] when no window is configured for `action_id`,
+/// [`Error::InvalidArgument`] when the stored window is malformed, and
+/// [`Error::Unauthorized`] when the action is early, late, or stale. The
+/// specific failure is also emitted as a ledger event so off-chain monitors
+/// can distinguish the three cases without parsing error codes.
+pub fn validate_scheduled_action(
+    env: &Env,
+    action_id: u64,
+    link: &ResourceLink,
+) -> Result<TimeWindow, Error> {
+    let window = scheduled_window(env, action_id).ok_or(Error::NotFound)?;
+    if !window.is_well_formed() {
+        return Err(Error::InvalidArgument);
+    }
+    let now = env.ledger().timestamp();
+    match window.validate(now) {
+        WindowStatus::Valid => Ok(window),
+        WindowStatus::Early => {
+            env.events().publish(
+                (symbol_short!("timeline"), symbol_short!("sched_early")),
+                (action_id, now, window.start),
+            );
+            Err(Error::Unauthorized)
+        }
+        WindowStatus::Late => {
+            env.events().publish(
+                (symbol_short!("timeline"), symbol_short!("sched_late")),
+                (action_id, now, window.end),
+            );
+            Err(Error::Unauthorized)
+        }
+        WindowStatus::Stale => {
+            let stale = window.stale_after.unwrap_or(window.end);
+            env.events().publish(
+                (symbol_short!("timeline"), symbol_short!("sched_stale")),
+                (action_id, now, stale),
+            );
+            Err(Error::Unauthorized)
+        }
+    }
+}
+
+/// Records that a scheduled action executed inside its window.
+///
+/// Must be called only after [`validate_scheduled_action`] has succeeded and
+/// the domain operation's own authorization has passed. Writes an audit entry
+/// so maintainers can review scheduled executions, and emits a user-facing
+/// timeline entry so the subject can see the action occurred.
+pub fn record_scheduled_execution(
+    env: &Env,
+    actor: &Address,
+    action_id: u64,
+    link: ResourceLink,
+    summary: Symbol,
+) -> Result<(), Error> {
+    let window = validate_scheduled_action(env, action_id, &link)?;
+    let now = env.ledger().timestamp();
+    persistent_set(
+        env,
+        &TimelineKey::ScheduledExecution(action_id),
+        &(now, actor.clone()),
+    );
+    write_audit_entry(
+        env,
+        actor.clone(),
+        TimelineEventType::RecordSettled,
+        link.clone(),
+        summary.clone(),
+    )?;
+    append_user_event(
+        env,
+        Some(actor.clone()),
+        TimelineEventType::RecordSettled,
+        Visibility::Participant,
+        link,
+        Some(actor.clone()),
+        summary,
+    )?;
+    env.events().publish(
+        (symbol_short!("timeline"), symbol_short!("sched_exec")),
+        (action_id, now, window.start, window.end),
+    );
+    Ok(())
+}
+
+/// Returns the ledger timestamp at which `action_id` last executed, if ever.
+pub fn scheduled_execution_time(env: &Env, action_id: u64) -> Option<u64> {
+    persistent_get::<_, (u64, Address)>(env, &TimelineKey::ScheduledExecution(action_id))
+        .map(|(ts, _)| ts)
 }
 
 // ---------------------------------------------------------------------------
