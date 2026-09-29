@@ -38,21 +38,24 @@ use shared::events::{
     emit_action_executed, emit_aid_created, emit_module_initialized, emit_permission_changed,
 };
 use shared::storage::{is_paused, persistent_get, persistent_set, set_paused as shared_set_paused};
-use shared::{emit, Error, AID_CLAIMED, AID_CREATED, AID_REFUNDED, AID_SETTLED};
+use shared::{
+    emit, record_action_audit_event, Error, ResourceLink, TimelineEventType, AID_CLAIMED,
+    AID_CREATED, AID_REFUNDED, AID_SETTLED,
+};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, panic_with_error, symbol_short, token, Address, Env,
-    Map, Symbol, Vec,
+    contract, contracterror, contractimpl, panic_with_error, symbol_short, token, Address, Bytes,
+    Env, Map, Symbol, Vec,
 };
 
 pub mod api;
 pub mod storage;
 pub mod types;
+pub mod correlation;
 
 use storage::{get_aid, get_aid_counter, has_aid, set_aid, set_aid_counter};
 
-pub use types::{AidPage, AidRecord, AidStatus, SearchIndexRepairReport};
+pub use types::{AidPage, AidPageResponse, AidRecord, AidStatus, SearchIndexRepairReport};
 
-const KEY_AIDS: Symbol = symbol_short!("aids");
 #[allow(dead_code)]
 const MAX_QUERY_LIMIT: u32 = 50;
 
@@ -74,6 +77,8 @@ pub enum AidError {
     /// The aid has already been refunded to the donor.
     AlreadyRefunded = 106,
     CannotDeletePending = 107,
+    /// The supplied correlation ID is malformed or violates policy.
+    InvalidCorrelationId = 108,
 }
 
 #[contract]
@@ -109,10 +114,8 @@ impl AidContract {
             return Err(shared::Error::AlreadyInitialized);
         }
 
-        admin.require_auth();
-
         // Store configuration
-        shared::auth::set_admin(&env, &admin);
+        shared::auth::initialize_admin(&env, &admin)?;
         storage::set_treasury(&env, &treasury);
         storage::set_token(&env, &token);
         storage::set_default_expiry(&env, default_expiry_secs);
@@ -207,6 +210,7 @@ impl AidContract {
         recipient: Address,
         amount: i128,
         expiry_ledger: u32,
+        correlation_id: Option<Bytes>,
     ) -> u64 {
         donor.require_auth();
 
@@ -215,8 +219,11 @@ impl AidContract {
             panic_with_error!(&env, Error::InvalidAmount);
         }
         if expiry_ledger <= env.ledger().sequence() {
-            env.panic_with_error(AidError::NotExpiredYet);
+            panic_with_error!(&env, Error::InvalidArgument);
         }
+
+        // Validate/normalize the optional correlation ID before any state change.
+        let correlation_id = correlation::normalize(&env, correlation_id);
 
         // Quota enforcement (Issue #65): fail-open when unconfigured so
         // existing deployments keep working until maintainers set limits.
@@ -256,11 +263,8 @@ impl AidContract {
         };
         set_aid(&env, aid_id, &record);
         index_aid(&env, aid_id);
-
-        let mut aids: Map<u64, AidRecord> = persistent_get(&env, &KEY_AIDS)
-            .unwrap_or_else(|| Map::new(&env));
-        aids.set(aid_id, record);
-        persistent_set(&env, &KEY_AIDS, &aids);
+        storage::append_donor_aid(&env, &donor, aid_id);
+        storage::append_recipient_aid(&env, &recipient, aid_id);
 
         emit_aid_created(
             &env,
@@ -270,12 +274,20 @@ impl AidContract {
             amount,
             env.ledger().sequence().into(),
             expiry_ledger.into(),
+            correlation_id.clone(),
         );
 
         emit(
             &env,
             AID_CREATED,
-            (aid_id, donor.clone(), recipient, amount, expiry_ledger),
+            (
+                aid_id,
+                donor.clone(),
+                recipient,
+                amount,
+                expiry_ledger,
+                correlation_id.clone(),
+            ),
         );
         emit_action_executed(
             &env,
@@ -285,6 +297,7 @@ impl AidContract {
             true,
             env.ledger().timestamp(),
         );
+        correlation::store(&env, aid_id, &correlation_id);
         // Escrow funds from donor into contract.
         token::Client::new(&env, &token).transfer(&donor, &env.current_contract_address(), &amount);
 
@@ -311,6 +324,7 @@ impl AidContract {
         recipient.require_auth();
 
         let mut record = get_aid(&env, aid_id).ok_or(AidError::NotFound)?;
+        let correlation_id = correlation::load(&env, aid_id);
 
         // Sequence of checks ordered by likely failure rate (cheap first)
         if record.status == AidStatus::Settled || record.status == AidStatus::Refunded {
@@ -333,8 +347,8 @@ impl AidContract {
             &record.amount,
         );
 
-        emit(&env, AID_CLAIMED, aid_id);
-        emit(&env, AID_SETTLED, aid_id);
+        emit(&env, AID_CLAIMED, (aid_id, correlation_id.clone()));
+        emit(&env, AID_SETTLED, (aid_id, correlation_id.clone()));
         emit_action_executed(
             &env,
             symbol_short!("aid"),
@@ -359,8 +373,15 @@ impl AidContract {
     /// - [`AidError::AlreadyClaimed`] — already settled.
     /// - [`AidError::AlreadyRefunded`] — already refunded.
     /// - [`AidError::NotExpiredYet`]  — expiry has not yet passed.
-    pub fn refund_aid(env: Env, aid_id: u64) -> Result<(), AidError> {
+    pub fn refund_aid(env: Env, aid_id: u64, caller: Address) -> Result<(), AidError> {
         let mut record = get_aid(&env, aid_id).ok_or(AidError::NotFound)?;
+        caller.require_auth();
+        let correlation_id = correlation::load(&env, aid_id);
+
+        let admin = shared::auth::get_admin(&env);
+        if caller != record.donor && caller != admin {
+            return Err(AidError::Unauthorized);
+        }
 
         // Check status first — avoids expensive ledger read on wrong state
         match record.status {
@@ -383,7 +404,7 @@ impl AidContract {
             &record.amount,
         );
 
-        emit(&env, AID_REFUNDED, aid_id);
+        emit(&env, AID_REFUNDED, (aid_id, correlation_id.clone()));
         emit_action_executed(
             &env,
             symbol_short!("aid"),
@@ -491,13 +512,6 @@ impl AidContract {
         }
         storage::remove_aid(&env, aid_id);
         remove_from_search_index(&env, aid_id);
-        let mut aids: Map<u64, AidRecord> = env
-            .storage()
-            .persistent()
-            .get(&KEY_AIDS)
-            .unwrap_or_else(|| Map::new(&env));
-        aids.remove(aid_id);
-        env.storage().persistent().set(&KEY_AIDS, &aids);
         Ok(())
     }
 
@@ -595,13 +609,58 @@ impl AidContract {
     // Admin controls
     // -----------------------------------------------------------------------
 
-    /// Pause or resume the contract. Admin only.
+    /// Grant or revoke the role allowed to pause or resume the contract.
+    pub fn set_pauser(
+        env: Env,
+        admin: Address,
+        pauser: Address,
+        enabled: bool,
+    ) -> Result<(), shared::Error> {
+        let was_pauser = shared::auth::has_role(&env, &pauser, shared::auth::Role::Pauser);
+        if enabled {
+            shared::auth::grant_role(&env, &admin, &pauser, shared::auth::Role::Pauser)?;
+        } else {
+            shared::auth::revoke_role(&env, &admin, &pauser, shared::auth::Role::Pauser)?;
+        }
+        record_action_audit_event(
+            &env,
+            &admin,
+            TimelineEventType::RoleChanged,
+            ResourceLink {
+                kind: Bytes::from_slice(&env, b"aid"),
+                id: 0,
+                revision: 0,
+            },
+            symbol_short!("aid"),
+            symbol_short!("pauser"),
+            if enabled {
+                symbol_short!("adm_grant")
+            } else {
+                symbol_short!("adm_rvok")
+            },
+            Some(pauser.clone()),
+            Some(symbol_short!("pauser")),
+            Some(if was_pauser { 1 } else { 0 }),
+            Some(if enabled { 1 } else { 0 }),
+        )?;
+        emit_permission_changed(
+            &env,
+            symbol_short!("aid"),
+            symbol_short!("pauser"),
+            &pauser,
+            enabled,
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Pause or resume the contract. Requires the Pauser permission.
     pub fn set_paused(env: Env, admin: Address, paused: bool) {
-        let contract_admin = shared::auth::get_admin(&env);
-        if admin != contract_admin {
+        if shared::auth::require_permission(&env, &admin, shared::auth::Permission::PauseContracts)
+            .is_err()
+        {
             env.panic_with_error(shared::Error::Unauthorized);
         }
-        admin.require_auth();
 
         env.storage()
             .instance()
@@ -624,9 +683,146 @@ impl AidContract {
     }
 
     /// Returns a paginated list of aid records assigned to `recipient`.
-    pub fn list_aids_by_recipient(env: Env, recipient: Address, cursor: u32, limit: u32) -> AidPage {
+    pub fn list_aids_by_recipient(
+        env: Env,
+        recipient: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> AidPage {
         let ids = storage::get_recipient_aids(&env, &recipient);
         paginate(&env, &ids, cursor, limit)
+    }
+
+    /// Stable keyset-paginated search for active aid records that `viewer` is authorized to discover.
+    /// Resumes strictly after `start_after_id` (or from beginning if `None`), guaranteeing stability
+    /// even if records are concurrently settled, hidden, or created.
+    pub fn search_aids_cursor(
+        env: Env,
+        viewer: Address,
+        start_after_id: Option<u64>,
+        limit: u32,
+    ) -> AidPageResponse {
+        viewer.require_auth();
+        let ids = storage::get_search_index(&env);
+        let req = shared::PageRequest::ascending(start_after_id, limit);
+        let res = shared::paginate_id_list(&env, &ids, &req, shared::DEFAULT_MAX_SCAN, |id| {
+            if let Some(record) = get_aid(&env, id) {
+                if can_discover(&env, &record, &viewer) {
+                    return Some(record);
+                }
+            }
+            None
+        })
+        .unwrap_or_else(|_| shared::PageResponse {
+            items: Vec::new(&env),
+            next_cursor: None,
+            has_more: false,
+            scanned_count: 0,
+        });
+
+        AidPageResponse {
+            records: res.items,
+            next_cursor: res.next_cursor,
+            has_more: res.has_more,
+            scanned_count: res.scanned_count,
+        }
+    }
+
+    /// Stable keyset-paginated list of aid records created by `donor`.
+    pub fn list_aids_by_donor_cursor(
+        env: Env,
+        donor: Address,
+        start_after_id: Option<u64>,
+        limit: u32,
+    ) -> AidPageResponse {
+        let ids = storage::get_donor_aids(&env, &donor);
+        let req = shared::PageRequest::ascending(start_after_id, limit);
+        let res = shared::paginate_id_list(&env, &ids, &req, shared::DEFAULT_MAX_SCAN, |id| {
+            get_aid(&env, id)
+        })
+        .unwrap_or_else(|_| shared::PageResponse {
+            items: Vec::new(&env),
+            next_cursor: None,
+            has_more: false,
+            scanned_count: 0,
+        });
+
+        AidPageResponse {
+            records: res.items,
+            next_cursor: res.next_cursor,
+            has_more: res.has_more,
+            scanned_count: res.scanned_count,
+        }
+    }
+
+    /// Stable keyset-paginated list of aid records assigned to `recipient`.
+    pub fn list_aids_by_recipient_cursor(
+        env: Env,
+        recipient: Address,
+        start_after_id: Option<u64>,
+        limit: u32,
+    ) -> AidPageResponse {
+        let ids = storage::get_recipient_aids(&env, &recipient);
+        let req = shared::PageRequest::ascending(start_after_id, limit);
+        let res = shared::paginate_id_list(&env, &ids, &req, shared::DEFAULT_MAX_SCAN, |id| {
+            get_aid(&env, id)
+        })
+        .unwrap_or_else(|_| shared::PageResponse {
+            items: Vec::new(&env),
+            next_cursor: None,
+            has_more: false,
+            scanned_count: 0,
+        });
+
+        AidPageResponse {
+            records: res.items,
+            next_cursor: res.next_cursor,
+            has_more: res.has_more,
+            scanned_count: res.scanned_count,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Bulk Import Pipeline (Issue #37)
+    // -----------------------------------------------------------------------
+
+    /// Dry-run simulation for bulk aid imports.
+    ///
+    /// Performs full validation, duplicate checking, diff calculation, and
+    /// generates rollback guidance without making any persistent storage writes.
+    pub fn import_aids_dry_run(
+        env: Env,
+        items: Vec<shared::import::ImportItem>,
+        config: shared::import::ImportConfig,
+    ) -> Result<shared::import::ImportReport, Error> {
+        let mut dry_config = config;
+        dry_config.dry_run = true;
+        shared::import::dry_run(&env, &items, &dry_config).map_err(|_| Error::InvalidArgument)
+    }
+
+    /// Execute a bulk import of aid records with idempotency and rollback guidance.
+    ///
+    /// Requires authorization from `caller` (donor or administrator).
+    /// Respects the configured execution mode (`AllOrNothing` vs `BestEffort`)
+    /// and duplicate policy (`SkipExisting`, `UpdateExisting`, `RejectDuplicate`).
+    pub fn import_aids(
+        env: Env,
+        caller: Address,
+        items: Vec<shared::import::ImportItem>,
+        config: shared::import::ImportConfig,
+    ) -> Result<shared::import::ImportReport, Error> {
+        caller.require_auth();
+        shared::auth::require_not_paused(&env)?;
+        shared::import::execute_import(&env, &caller, &items, &config)
+            .map_err(|_| Error::InvalidArgument)
+    }
+
+    /// Look up an imported aid record by its external business ID.
+    pub fn get_imported_aid(
+        env: Env,
+        external_id: Bytes,
+    ) -> Option<shared::import::StoredImportRecord> {
+        shared::import::get_imported_record(&env, &external_id)
     }
 }
 
